@@ -1,0 +1,20 @@
+# Local credentials
+.env
+.env.*
+!.env.example
+env.txt
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local model artifacts and temporary clones
+*.joblib
+*.pkl
+.pulso-source/
+
+# Course handouts: redistribute only when permitted
+pulso-transmi-guia-*.pdf
+pulso-transmi-guia-*_extracted.txt

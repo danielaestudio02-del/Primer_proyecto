@@ -1,0 +1,32 @@
+{
+  "dataset": "pulso-transmi-starter-v1",
+  "generated_at": "2026-09-16",
+  "timezone": "America/Bogota",
+  "frequency_minutes": 15,
+  "history_days": 45,
+  "periods_per_station": 4320,
+  "station_count": 12,
+  "observation_rows": 51840,
+  "context_rows": 4320,
+  "history_start": "2026-07-26T00:00:00-05:00",
+  "history_end": "2026-09-08T23:45:00-05:00",
+  "generator_seed": 20260916,
+  "future_included": false,
+  "demand_is_synthetic": true,
+  "station_metadata_source": "https://gis.transmilenio.gov.co/arcgis/rest/services/Troncal/consulta_estaciones_troncales/FeatureServer/0",
+  "station_metadata_verified_at": "2026-09-16",
+  "files": {
+    "stations.csv": {
+      "rows": 12,
+      "sha256": "d4dea46ceee2fb3ebe76362fbaa925c95b586130270c0998438f42494a7471ef"
+    },
+    "observations.csv": {
+      "rows": 51840,
+      "sha256": "ecc6a32174f84e810c4b684db52f5e4eebd815f11f5e5b22d3574116b837eacd"
+    },
+    "context.csv": {
+      "rows": 4320,
+      "sha256": "891f422628cc5033eaf89a1e8f7e69edab65afba1495a8072d2b395965d7656d"
+    }
+  }
+}
