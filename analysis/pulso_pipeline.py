@@ -24,7 +24,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from supabase import Client, create_client
 
-from compare_baselines import build_examples, score
+from forecasting_core import build_examples, score
 
 
 ROOT = Path(__file__).resolve().parents[1]
