@@ -1,0 +1,29 @@
+name: Train and promote Random Forest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-pipeline.txt
+      - name: Install pipeline dependencies
+        run: python -m pip install -r requirements-pipeline.txt
+      - name: Sync latest released observations
+        run: python analysis/pulso_pipeline.py sync
+      - name: Train, validate, save joblib and promote only if it beats weekly naive
+        run: python analysis/pulso_pipeline.py train

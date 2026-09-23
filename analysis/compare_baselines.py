@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import os
 from pathlib import Path
 
 import matplotlib
@@ -93,14 +95,88 @@ def score(predictions: pd.DataFrame, prediction_column: str) -> tuple[dict, pd.D
     }, horizon
 
 
+def load_local_env() -> None:
+    """Read local credentials without printing their values."""
+    env_path = ROOT / ".env.local"
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        value = value.strip().strip('"').strip("'")
+        if name.strip() and value:
+            os.environ.setdefault(name.strip(), value)
+
+
+def load_observations(source: str) -> pd.DataFrame:
+    if source == "local":
+        frame = pd.read_csv(
+            DATA / "observations.csv",
+            parse_dates=["observed_at"],
+            dtype={"station_id": "string"},
+        )
+    else:
+        load_local_env()
+        url = os.environ.get("SUPABASE_URL")
+        secret = os.environ.get("SUPABASE_SECRET_KEY")
+        if not url or not secret:
+            raise SystemExit(
+                "Faltan SUPABASE_URL o SUPABASE_SECRET_KEY en .env.local; valores ocultos."
+            )
+        from supabase import create_client
+
+        client = create_client(url, secret)
+        page_size = 1000
+        rows: list[dict] = []
+        try:
+            start = 0
+            while True:
+                response = (
+                    client.table("observations")
+                    .select("station_id,observed_at,demand")
+                    .order("station_id")
+                    .order("observed_at")
+                    .range(start, start + page_size - 1)
+                    .execute()
+                )
+                page = response.data or []
+                rows.extend(page)
+                if len(page) < page_size:
+                    break
+                start += page_size
+        except SystemExit:
+            raise
+        except Exception as exc:
+            raise SystemExit(
+                f"Lectura de Supabase interrumpida ({type(exc).__name__}); valores ocultos."
+            ) from None
+        if not rows:
+            raise SystemExit("Supabase devolvió cero observaciones; benchmark cancelado.")
+        frame = pd.DataFrame.from_records(rows)
+        frame["station_id"] = frame["station_id"].astype("string")
+        frame["observed_at"] = pd.to_datetime(frame["observed_at"], utc=True)
+
+    if frame.duplicated(["station_id", "observed_at"]).any():
+        raise SystemExit("Hay claves station_id/observed_at duplicadas; benchmark cancelado.")
+    if frame["demand"].isna().any() or frame["demand"].lt(0).any():
+        raise SystemExit("La demanda contiene valores inválidos; benchmark cancelado.")
+    return frame
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Compara baselines con corte temporal.")
+    parser.add_argument(
+        "--source",
+        choices=("local", "supabase"),
+        default="local",
+        help="Origen de observaciones (predeterminado: local).",
+    )
+    args = parser.parse_args()
     REPORTS.mkdir(exist_ok=True)
     FIGURES.mkdir(exist_ok=True)
-    observations = pd.read_csv(
-        DATA / "observations.csv",
-        parse_dates=["observed_at"],
-        dtype={"station_id": "string"},
-    )
+    observations = load_observations(args.source)
     observations["observed_at"] = pd.to_datetime(observations["observed_at"], utc=True)
     end = observations["observed_at"].max()
     split = end.normalize() - pd.Timedelta(days=6)
@@ -207,6 +283,7 @@ Estos resultados son una primera referencia local sobre datos sintéticos. El ve
 El baseline diario usa el valor de la misma hora del día anterior; el semanal usa el valor de la misma hora y día de la semana anterior. Ambos solo consultan observaciones disponibles a la hora de origen del pronóstico.
 """
     (REPORTS / "model_baselines_v1.md").write_text(report, encoding="utf-8")
+    print(f"Origen de observaciones: {args.source}")
     print(f"Corte: {split.tz_convert(TZ)}")
     print(f"Filas train/test: {len(train):,}/{len(test):,}")
     print(comparison.round(2).to_string())

@@ -35,6 +35,24 @@ select has_table_privilege('anon', 'public.observations', 'select') as anon_can_
 
 Ambos resultados deben ser `false`. Las consultas futuras desde Python/GitHub Actions se autentican en el backend con la clave secreta.
 
+## Leer los datos desde Supabase para el benchmark
+
+El comparador conserva `local` como origen predeterminado. Para leer la tabla `observations` desde Supabase con paginación y usar el mismo holdout temporal:
+
+```powershell
+python analysis/compare_baselines.py --source supabase
+```
+
+El programa carga las variables desde `.env.local`, no imprime sus valores y vuelve a escribir `reports/model_baselines_v1.md` y la figura comparativa. Para reproducir el resultado original con los CSV locales, ejecuta `python analysis/compare_baselines.py`.
+
+Para evaluar varios métodos en varios cortes temporales, instala también los modelos y dependencias de visualización con `python -m pip install -r requirements-modeling.txt`, y ejecuta:
+
+```powershell
+python analysis/backtest_models.py --source supabase
+```
+
+El script compara persistencia, naive diario, naive semanal, Random Forest y XGBoost en tres ventanas semanales consecutivas. Genera `reports/backtest_modelos_v1.md` con métricas medias, variación y peor fold.
+
 ## Más adelante
 
 El collector guardará la nueva página de observaciones y solo avanzará `collector_state.confirmed_cursor` después de completar el upsert. Las ejecuciones y recibos se conservan para auditoría; la clave de Pulso TransMi nunca se guarda en tablas ni logs.
