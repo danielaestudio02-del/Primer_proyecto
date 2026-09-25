@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pulso TransMi — Resultados</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #f6f7f9; --card: #ffffff; --text: #1d2330; --muted: #5f6878;
+      --border: #e2e5ea; --accent: #c8102e; --accent2: #2463eb; --ok: #1a7f37; --bad: #b42318;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #12151b; --card: #1b1f27; --text: #e8eaef; --muted: #9aa3b2;
+        --border: #2b313c; --accent: #ff4d63; --accent2: #6d9bff; --ok: #4ac26b; --bad: #ff6b5e;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text);
+      font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    header { padding: 24px 16px 8px; max-width: 1100px; margin: 0 auto; }
+    h1 { margin: 0; font-size: 1.5rem; }
+    h1 span { color: var(--accent); }
+    .sub { color: var(--muted); margin: 4px 0 0; }
+    main { max-width: 1100px; margin: 0 auto; padding: 8px 16px 40px; display: grid; gap: 16px; }
+    .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; min-width: 0; }
+    .kpi .label { color: var(--muted); font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }
+    .kpi .value { font-size: 1.6rem; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
+    .kpi .note { color: var(--muted); font-size: .8rem; }
+    h2 { font-size: 1.05rem; margin: 0 0 12px; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+    select { font: inherit; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--card); color: var(--text); }
+    .chart { position: relative; height: 300px; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    th { color: var(--muted); font-weight: 600; }
+    .ok { color: var(--ok); } .bad { color: var(--bad); }
+    .error { color: var(--bad); }
+    footer { color: var(--muted); font-size: .8rem; text-align: center; padding-bottom: 24px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Pulso <span>TransMi</span> — resultados del modelo</h1>
+    <p class="sub" id="subtitle">Cargando datos…</p>
+  </header>
+  <main>
+    <section class="kpis">
+      <div class="card kpi"><div class="label">Accuracy oficial (7 días)</div><div class="value" id="kpi-acc">—</div><div class="note" id="kpi-acc-note"></div></div>
+      <div class="card kpi"><div class="label">WAPE medio por estación</div><div class="value" id="kpi-wape">—</div><div class="note">menor es mejor</div></div>
+      <div class="card kpi"><div class="label">Modelo champion</div><div class="value" id="kpi-model" style="font-size:1.05rem">—</div><div class="note" id="kpi-model-note"></div></div>
+      <div class="card kpi"><div class="label">Últimos datos</div><div class="value" id="kpi-fresh" style="font-size:1.05rem">—</div><div class="note" id="kpi-fresh-note"></div></div>
+    </section>
+
+    <section class="card">
+      <h2>Accuracy por estación</h2>
+      <div class="chart"><canvas id="chart-stations"></canvas></div>
+    </section>
+
+    <section class="card">
+      <div class="row">
+        <h2 style="margin:0">Predicción vs. demanda observada</h2>
+        <select id="station-select" aria-label="Estación"></select>
+      </div>
+      <div class="chart"><canvas id="chart-pred"></canvas></div>
+    </section>
+
+    <section class="card">
+      <h2>Entregas recientes</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Ciclo</th><th>Aceptada</th><th>Modelo</th><th>Intento</th><th>Estado</th><th>Predicciones</th></tr></thead>
+          <tbody id="submissions"><tr><td colspan="6">Cargando…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+  <footer>Datos servidos desde Supabase mediante la API de solo lectura <code>api_*</code>.</footer>
+
+  <script>
+    const fmtDate = (v) => v ? new Date(v).toLocaleString("es-CO", { timeZone: "America/Bogota", dateStyle: "short", timeStyle: "short" }) : "—";
+    const fmtNum = (v, d = 2) => (v === null || v === undefined) ? "—" : Number(v).toFixed(d);
+    const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+    async function api(endpoint, params = {}) {
+      const qs = new URLSearchParams({ endpoint, ...params });
+      const res = await fetch(`/api/pulso?${qs}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      return data;
+    }
+
+    Chart.defaults.color = css("--muted");
+    Chart.defaults.borderColor = css("--border");
+    let predChart;
+
+    async function loadSummary() {
+      const [status, champion, accuracy] = await Promise.all([api("status"), api("champion"), api("accuracy", { days: 7 })]);
+      document.getElementById("subtitle").textContent =
+        `${status.stations} estaciones · ${Number(status.observation_rows).toLocaleString("es-CO")} observaciones`;
+
+      document.getElementById("kpi-acc").textContent = accuracy.official_accuracy == null ? "—" : `${fmtNum(accuracy.official_accuracy)}%`;
+      document.getElementById("kpi-acc-note").textContent = `${accuracy.evaluated_targets} targets · ${accuracy.cycles} ciclos`;
+      document.getElementById("kpi-wape").textContent = fmtNum(accuracy.mean_station_wape, 3);
+
+      const champ = champion[0];
+      document.getElementById("kpi-model").textContent = champ ? champ.model_version : "sin champion";
+      const rf = champ?.validation_metrics?.random_forest?.official_accuracy;
+      const naive = champ?.validation_metrics?.weekly_naive?.official_accuracy;
+      document.getElementById("kpi-model-note").textContent =
+        rf == null ? "" : `validación RF ${fmtNum(rf)}%` + (naive == null ? "" : ` vs naive ${fmtNum(naive)}%`);
+
+      document.getElementById("kpi-fresh").textContent = fmtDate(status.last_observed_at);
+      const cycle = status.latest_cycle;
+      document.getElementById("kpi-fresh-note").textContent = cycle ? `último ciclo ${cycle.cycle_id} (${cycle.status})` : "sin ciclos";
+
+      const rows = accuracy.by_station || [];
+      new Chart(document.getElementById("chart-stations"), {
+        type: "bar",
+        data: {
+          labels: rows.map((r) => r.station_id),
+          datasets: [{ label: "Accuracy (%)", data: rows.map((r) => r.accuracy), backgroundColor: css("--accent2"), borderRadius: 4 }],
+        },
+        options: { maintainAspectRatio: false, plugins: { legend: { display: false } },
+          scales: { y: { min: 0, max: 100, title: { display: true, text: "%" } } } },
+      });
+    }
+
+    async function loadStations() {
+      const stations = await api("stations");
+      const select = document.getElementById("station-select");
+      select.innerHTML = stations.map((s) => `<option value="${esc(s.station_id)}">${esc(s.station_id)} — ${esc(s.station_name)}</option>`).join("");
+      select.addEventListener("change", () => loadStation(select.value));
+      if (stations.length) loadStation(stations[0].station_id);
+    }
+
+    async function loadStation(stationId) {
+      const [demand, preds] = await Promise.all([
+        api("demand", { station_id: stationId, hours: 48 }),
+        api("predictions", { station_id: stationId }),
+      ]);
+      // Keep the shortest horizon per target so the line shows one prediction per timestamp.
+      const byTarget = new Map();
+      for (const p of preds) {
+        const prev = byTarget.get(p.target_at);
+        if (!prev || p.horizon_minutes < prev.horizon_minutes) byTarget.set(p.target_at, p);
+      }
+      const datasets = [
+        { label: "Demanda observada", data: demand.map((d) => ({ x: new Date(d.observed_at).getTime(), y: d.demand })),
+          borderColor: css("--muted"), pointRadius: 0, borderWidth: 1.5 },
+        { label: "Predicción", data: [...byTarget.values()].map((p) => ({ x: new Date(p.target_at).getTime(), y: p.predicted_value })),
+          borderColor: css("--accent"), backgroundColor: css("--accent"), showLine: false, pointRadius: 3 },
+      ];
+      predChart?.destroy();
+      predChart = new Chart(document.getElementById("chart-pred"), {
+        type: "line",
+        data: { datasets },
+        options: {
+          maintainAspectRatio: false, parsing: false,
+          interaction: { mode: "nearest", intersect: false },
+          scales: { x: { type: "linear", ticks: { callback: (v) => fmtDate(v), maxTicksLimit: 6 } }, y: { beginAtZero: true } },
+          plugins: { tooltip: { callbacks: { title: (items) => fmtDate(items[0].parsed.x) } } },
+        },
+      });
+    }
+
+    async function loadSubmissions() {
+      const subs = await api("submissions", { limit: 15 });
+      const tbody = document.getElementById("submissions");
+      if (!subs.length) { tbody.innerHTML = `<tr><td colspan="6">Todavía no hay entregas.</td></tr>`; return; }
+      tbody.innerHTML = subs.map((s) => {
+        const complete = Number(s.stored_predictions) === Number(s.expected_predictions);
+        return `<tr><td>${esc(s.cycle_id)}</td><td>${fmtDate(s.accepted_at)}</td><td>${esc(s.model_version)}</td>
+          <td>${s.attempt}</td><td>${esc(s.status)}</td>
+          <td class="${complete ? "ok" : "bad"}">${s.stored_predictions}/${s.expected_predictions}</td></tr>`;
+      }).join("");
+    }
+
+    function fail(err) {
+      const el = document.getElementById("subtitle");
+      el.textContent = `Error al cargar datos: ${err.message}`;
+      el.classList.add("error");
+    }
+
+    loadSummary().catch(fail);
+    loadStations().catch(fail);
+    loadSubmissions().catch(fail);
+  </script>
+</body>
+</html>
