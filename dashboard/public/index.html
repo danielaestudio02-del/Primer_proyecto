@@ -110,10 +110,12 @@
 
       const champ = champion[0];
       document.getElementById("kpi-model").textContent = champ ? champ.model_version : "sin champion";
-      const rf = champ?.validation_metrics?.random_forest?.official_accuracy;
-      const naive = champ?.validation_metrics?.weekly_naive?.official_accuracy;
+      const metrics = champ?.validation_metrics ?? {};
+      const own = metrics.ensemble?.official_accuracy ?? metrics.random_forest?.official_accuracy;
+      const label = metrics.ensemble ? "ensamble" : "RF";
+      const naive = metrics.weekly_naive?.official_accuracy;
       document.getElementById("kpi-model-note").textContent =
-        rf == null ? "" : `validación RF ${fmtNum(rf)}%` + (naive == null ? "" : ` vs naive ${fmtNum(naive)}%`);
+        own == null ? "" : `validación ${label} ${fmtNum(own)}%` + (naive == null ? "" : ` vs naive ${fmtNum(naive)}%`);
 
       document.getElementById("kpi-fresh").textContent = fmtDate(status.last_observed_at);
       const cycle = status.latest_cycle;

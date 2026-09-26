@@ -20,9 +20,9 @@ pip install -r requirements-supabase.txt
 
 Las credenciales locales van en `.env.local` y no deben subirse al repositorio. Usa `.env.example` como referencia sin agregar secretos reales.
 
-Para repetir la comparación de un solo corte, ejecuta `python analysis/compare_baselines.py --source supabase`. Para comparar persistencia, los naives diario/semanal, Random Forest y XGBoost en tres semanas temporales, instala `python -m pip install -r requirements-modeling.txt` y ejecuta `python analysis/backtest_models.py --source supabase`.
+Para repetir la comparación de un solo corte, ejecuta `python analysis/compare_baselines.py --source supabase`. Para comparar persistencia, los naives diario/semanal, Random Forest, XGBoost y el ensamble de producción (Prophet + LightGBM) en tres semanas temporales, instala `python -m pip install -r requirements-modeling.txt` y ejecuta `python analysis/backtest_models.py --source supabase`.
 
-La sincronización continua y los envíos por ciclo están en `analysis/pulso_pipeline.py`. Requieren un bucket privado de Supabase Storage llamado `model-artifacts` y los GitHub Actions Secrets `PULSO_API_KEY`, `SUPABASE_URL` y `SUPABASE_SECRET_KEY`. Consulta [la guía de operación](reports/operacion_envios_v1.md) para la preparación y el primer entrenamiento. El workflow revisa ciclos cada 10 minutos; entrena/promueve aparte y solo entrega si hay ciclo abierto y un champion válido.
+La sincronización continua y los envíos por ciclo están en `analysis/pulso_pipeline.py`. Requieren un bucket privado de Supabase Storage llamado `model-artifacts` y los GitHub Actions Secrets `PULSO_API_KEY`, `SUPABASE_URL` y `SUPABASE_SECRET_KEY`. Consulta [la guía de operación](reports/operacion_envios_v1.md) para la preparación y el primer entrenamiento. El workflow revisa ciclos cada 10 minutos; entrena/promueve una vez al día (o ante drift) y solo entrega si hay ciclo abierto y un champion válido. El modelo de producción es un ensamble 65% Prophet + 35% LightGBM con ajuste de nivel de 2 horas, empaquetado en un `.joblib` (ver `analysis/ensemble_model.py` y [el backtest](reports/backtest_modelos_v1.md)).
 
 ## Dashboard en Vercel
 
