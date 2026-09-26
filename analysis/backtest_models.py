@@ -1,4 +1,4 @@
-"""Compare simple baselines, Random Forest, and XGBoost over weekly time folds."""
+"""Compare simple baselines, tree models, and the production ensemble over weekly time folds."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
+from ensemble_model import PulsoEnsemble
 from compare_baselines import (
     FIGURES,
     REPORTS,
@@ -39,6 +40,7 @@ MODEL_NAMES = {
     "Naive estacional semanal": "weekly",
     "Random Forest": "random_forest",
     "XGBoost": "xgboost",
+    "Ensamble Prophet + LightGBM": "ensemble",
 }
 
 
@@ -121,6 +123,11 @@ def run_fold(observations: pd.DataFrame, split: pd.Timestamp) -> tuple[pd.DataFr
         model.fit(train[FEATURES], train["y"])
         test[name] = np.maximum(0, model.predict(test[FEATURES]))
         print(f"  {name}: entrenamiento y predicción completados ({len(test):,} filas validadas)")
+
+    # Same class and settings as the production champion; trained only on data before the split.
+    ensemble = PulsoEnsemble().fit(observations, split - pd.Timedelta(minutes=15))
+    test["ensemble"] = ensemble.predict(observations, test)
+    print(f"  ensemble: entrenamiento y predicción completados ({len(test):,} filas validadas)")
 
     return test, {"start": split, "end": fold_end, "train_rows": len(train), "test_rows": len(test)}
 
@@ -205,7 +212,7 @@ def main() -> None:
 
 - Origen de los datos: `{args.source}`.
 - {args.folds} ventanas semanales consecutivas. Cada fold entrena solo con targets anteriores a su corte y valida en la semana siguiente.
-- Las features usan estación, horizonte, calendario, rezagos y promedios calculados hasta el origen. No se incluyen variables futuras de contexto.
+- Las features usan estación, horizonte, calendario, rezagos y promedios calculados hasta el origen. No se incluyen variables futuras de contexto. Prophet se entrena por fold solo con observaciones anteriores al corte.
 - Accuracy usa la métrica oficial: WAPE calculado por estación y luego promediado sin ponderar.
 - Todos los resultados usan el starter sintético; no son puntajes oficiales de competencia.
 
@@ -230,6 +237,7 @@ La desviación estándar y el mínimo entre folds ayudan a ver si un modelo depe
 - **Naive estacional semanal:** repite el valor de la misma estación, hora y día de la semana anterior.
 - **Random Forest:** combina rezagos, medias móviles, calendario, estación y horizonte con muchos árboles entrenados sobre muestras/features aleatorias.
 - **XGBoost:** combina árboles construidos secuencialmente; cada árbol intenta corregir errores de los anteriores.
+- **Ensamble Prophet + LightGBM (champion de producción):** 65% Prophet por estación (perfil diario/semanal promediado de muchas semanas, escalado por la razón demanda real/esperada de las últimas 2 horas) + 35% LightGBM global con rezagos, pendientes, valores de la misma franja ayer y la semana pasada y perfiles promediados de 4 semanas. Es el mismo código (`analysis/ensemble_model.py`) que se entrena y empaqueta en el joblib del pipeline.
 
 Los tres primeros son baselines interpretables. Indican qué tan difícil es la serie y evitan atribuir valor a un modelo complejo que no supere reglas sencillas.
 """

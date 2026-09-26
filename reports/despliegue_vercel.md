@@ -43,7 +43,9 @@ curl -X POST "$SUPABASE_URL/rest/v1/rpc/api_accuracy_summary" \
 
 ### 1. Supabase
 
-1. Abre **SQL Editor** y ejecuta `supabase/migrations/202609250001_results_api.sql` (después de la migración inicial).
+1. Abre **SQL Editor** y ejecuta, en orden y después de la migración inicial:
+   - `supabase/migrations/202609250001_results_api.sql`
+   - `supabase/migrations/202609260001_results_api_virtual_clock.sql`: ancla las ventanas de resultados a la observación más reciente y no a la fecha real, porque la competencia usa un reloj virtual.
 2. Comprueba que el navegador sigue sin poder leer las tablas, pero sí puede usar la API:
 
    ```sql

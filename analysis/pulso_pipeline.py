@@ -24,6 +24,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from supabase import Client, create_client
 
+from ensemble_model import FEATURES as ENSEMBLE_FEATURES
+from ensemble_model import PulsoEnsemble
 from forecasting_core import build_examples, score
 
 
@@ -32,12 +34,22 @@ BASE_URL = "https://pulso-transmi.72-60-245-2.sslip.io"
 ARTIFACT_BUCKET = "model-artifacts"
 PAGE_SIZE = 1000
 STREAM_PAGE_SIZE = 5000
+MODEL_FAMILY = "prophet_lgbm_ensemble"
+# Random Forest: former champion family, kept as the reference challenger and for
+# forecasting with champions trained before the ensemble existed.
 CATEGORICAL = ["station_id", "horizon"]
 NUMERIC = [
     "hour_sin", "hour_cos", "dow_sin", "dow_cos", "lag_1", "lag_4",
     "lag_96", "lag_672", "rolling_4", "rolling_96",
 ]
 FEATURES = CATEGORICAL + NUMERIC
+# Drift alert: observed/expected demand outside this band, on the same side, in each
+# of the last DRIFT_WINDOWS non-overlapping windows of DRIFT_WINDOW_STEPS slots (3 x 4 h).
+# On the starter data: ~0.6% false alarms per station-hour, ~79% detection of a +20% shift.
+DRIFT_BAND = (0.85, 1.15)
+DRIFT_WINDOW_STEPS = 16
+DRIFT_WINDOWS = 3
+DRIFT_RETRAIN_MIN_AGE = pd.Timedelta(hours=6)
 
 
 def load_local_env() -> None:
@@ -272,18 +284,9 @@ def hourly_origins(frame: pd.DataFrame) -> pd.DatetimeIndex:
     return times[times.tz_convert("America/Bogota").minute == 0]
 
 
-def train_and_promote(client: Client, cutoff: pd.Timestamp) -> dict:
-    history = load_observations(client, cutoff)
-    if history.empty:
-        raise RuntimeError("No hay datos anteriores al cutoff para entrenar.")
-    station_latest = history.groupby("station_id")["observed_at"].max()
-    too_stale = station_latest[station_latest < cutoff - pd.Timedelta(minutes=30)]
-    if not too_stale.empty:
-        raise RuntimeError(
-            "Faltan observaciones recientes al cutoff para estaciones: "
-            + ", ".join(map(str, too_stale.index.tolist()))
-        )
-
+def validate_and_fit(history: pd.DataFrame, cutoff: pd.Timestamp) -> dict:
+    """Temporal holdout (last 7 local days) for the ensemble vs. weekly naive and a
+    Random Forest challenger; if the ensemble beats both, refit it up to the cutoff."""
     origins = hourly_origins(history)
     if len(origins) < 2:
         raise RuntimeError("No hay suficientes orígenes horarios para entrenar.")
@@ -302,31 +305,63 @@ def train_and_promote(client: Client, cutoff: pd.Timestamp) -> dict:
     if train.empty or validation.empty:
         raise RuntimeError("No se pudo formar el holdout temporal antes de entrenar.")
 
-    validator = make_model()
-    validator.fit(train[FEATURES], train["y"])
-    validation["random_forest"] = np.maximum(0, validator.predict(validation[FEATURES]))
-    rf_metrics, _ = score(validation, "random_forest")
-    weekly_metrics, _ = score(validation, "weekly")
+    validator = PulsoEnsemble().fit(history, validation_start - pd.Timedelta(minutes=15))
+    validation["ensemble"] = validator.predict(history, validation)
+    challenger = make_model()
+    challenger.fit(train[FEATURES], train["y"])
+    validation["random_forest"] = np.maximum(0, challenger.predict(validation[FEATURES]))
+    metrics = {
+        name: score(validation, column)[0]
+        for name, column in (
+            ("ensemble", "ensemble"),
+            ("random_forest", "random_forest"),
+            ("weekly_naive", "weekly"),
+        )
+    }
     print(
         "Validación reciente (accuracy oficial): "
-        f"RF={rf_metrics['official_accuracy']:.2f}%, "
-        f"naive semanal={weekly_metrics['official_accuracy']:.2f}%"
+        f"ensamble={metrics['ensemble']['official_accuracy']:.2f}%, "
+        f"RF={metrics['random_forest']['official_accuracy']:.2f}%, "
+        f"naive semanal={metrics['weekly_naive']['official_accuracy']:.2f}%"
     )
-    if rf_metrics["official_accuracy"] <= weekly_metrics["official_accuracy"]:
+    best_reference = max(
+        metrics["random_forest"]["official_accuracy"], metrics["weekly_naive"]["official_accuracy"]
+    )
+    if metrics["ensemble"]["official_accuracy"] <= best_reference:
         raise RuntimeError(
-            "Random Forest no superó el naive semanal en el holdout reciente; "
+            "El ensamble no superó al naive semanal y al Random Forest en el holdout reciente; "
             "se conserva el champion actual y no se promueve este candidato."
         )
 
-    final_examples = examples.loc[examples["target_at"] <= cutoff].copy()
-    if final_examples.empty:
-        raise RuntimeError("No hay ejemplos etiquetados antes del cutoff final.")
-    model = make_model()
-    model.fit(final_examples[FEATURES], final_examples["y"])
-    training_data_start = final_examples["target_at"].min()
-    training_data_end = final_examples["target_at"].max()
+    model = PulsoEnsemble().fit(history, cutoff)
+    return {
+        "model": model,
+        "metrics": metrics,
+        "validation_start": validation_start,
+        "training_data_start": history["observed_at"].min(),
+        "training_data_end": history.loc[history["observed_at"] <= cutoff, "observed_at"].max(),
+    }
+
+
+def train_and_promote(client: Client, cutoff: pd.Timestamp) -> dict:
+    history = load_observations(client, cutoff)
+    if history.empty:
+        raise RuntimeError("No hay datos anteriores al cutoff para entrenar.")
+    station_latest = history.groupby("station_id")["observed_at"].max()
+    too_stale = station_latest[station_latest < cutoff - pd.Timedelta(minutes=30)]
+    if not too_stale.empty:
+        raise RuntimeError(
+            "Faltan observaciones recientes al cutoff para estaciones: "
+            + ", ".join(map(str, too_stale.index.tolist()))
+        )
+
+    result = validate_and_fit(history, cutoff)
+    model = result["model"]
+    validation_start = result["validation_start"]
+    training_data_start = result["training_data_start"]
+    training_data_end = result["training_data_end"]
     trained_at = datetime.now(timezone.utc)
-    version = f"rf-{trained_at.strftime('%Y%m%dT%H%M%S%fZ')}"
+    version = f"ens-{trained_at.strftime('%Y%m%dT%H%M%S%fZ')}"
     git_commit = None
     try:
         candidate = subprocess.check_output(
@@ -339,7 +374,7 @@ def train_and_promote(client: Client, cutoff: pd.Timestamp) -> dict:
 
     run_result = client.table("training_runs").insert(
         {
-            "model_family": "random_forest_global",
+            "model_family": MODEL_FAMILY,
             "finished_at": trained_at.isoformat(),
             "training_data_start": training_data_start.isoformat(),
             "training_data_end": training_data_end.isoformat(),
@@ -347,17 +382,9 @@ def train_and_promote(client: Client, cutoff: pd.Timestamp) -> dict:
             "validation_end": cutoff.isoformat(),
             "status": "completed",
             "code_commit": git_commit,
-            "parameters": {
-                "n_estimators": 120,
-                "min_samples_leaf": 3,
-                "max_features": 0.8,
-                "random_state": 42,
-            },
-            "metrics": {
-                "random_forest": rf_metrics,
-                "weekly_naive": weekly_metrics,
-            },
-            "notes": "Candidato validado temporalmente contra naive semanal.",
+            "parameters": model.get_config(),
+            "metrics": result["metrics"],
+            "notes": "Ensamble validado temporalmente contra naive semanal y Random Forest.",
         }
     ).execute()
     training_run_id = run_result.data[0]["training_run_id"]
@@ -365,17 +392,16 @@ def train_and_promote(client: Client, cutoff: pd.Timestamp) -> dict:
     artifact_path = f"{version}/model.joblib"
     artifact_uri = f"supabase://{ARTIFACT_BUCKET}/{artifact_path}"
     artifact = {
-        "pipeline": model,
+        "model": model,
+        "model_type": MODEL_FAMILY,
         "model_version": version,
         "training_data_start": training_data_start.isoformat(),
         "training_data_end": training_data_end.isoformat(),
         "trained_at": trained_at.isoformat(),
         "code_commit": git_commit,
-        "features": FEATURES,
-        "validation_metrics": {
-            "random_forest": rf_metrics,
-            "weekly_naive": weekly_metrics,
-        },
+        "features": ENSEMBLE_FEATURES,
+        "config": model.get_config(),
+        "validation_metrics": result["metrics"],
     }
     buffer = io.BytesIO()
     joblib.dump(artifact, buffer, compress=3)
@@ -399,9 +425,12 @@ def train_and_promote(client: Client, cutoff: pd.Timestamp) -> dict:
             "training_data_end": training_data_end.isoformat(),
             "code_commit": git_commit,
             "artifact_uri": artifact_uri,
-            "features": FEATURES,
+            "features": ENSEMBLE_FEATURES,
             "validation_metrics": artifact["validation_metrics"],
-            "notes": "Champion inicial RF; superó naive semanal en holdout temporal reciente.",
+            "notes": (
+                "Ensamble 65% Prophet (ajuste de nivel 2 h) + 35% LightGBM; superó al naive "
+                "semanal y al Random Forest en el holdout temporal reciente."
+            ),
         }
     ).execute()
 
@@ -441,12 +470,13 @@ def load_champion(client: Client) -> dict:
     return artifact
 
 
-def build_target_features(history: pd.DataFrame, cycle: dict) -> pd.DataFrame:
+def cycle_target_rows(history: pd.DataFrame, cycle: dict) -> pd.DataFrame:
+    """Validate the cycle targets against the cutoff and history; one row per target."""
     cutoff = pd.Timestamp(cycle["data_cutoff"])
     if cutoff.tzinfo is None:
         raise RuntimeError("El cutoff del ciclo no incluye zona horaria.")
     cutoff = cutoff.tz_convert("UTC")
-    station_ids = set(history["station_id"].astype(str))
+    history_counts = history.loc[history["observed_at"] <= cutoff, "station_id"].astype(str).value_counts()
     rows: list[dict] = []
     targets = cycle.get("targets") or []
     if len(targets) != cycle.get("expected_predictions"):
@@ -465,22 +495,38 @@ def build_target_features(history: pd.DataFrame, cycle: dict) -> pd.DataFrame:
         if (station_id, target_at.isoformat()) in seen:
             raise RuntimeError("El ciclo contiene targets duplicados.")
         seen.add((station_id, target_at.isoformat()))
-        if station_id not in station_ids:
+        if station_id not in history_counts.index:
             raise RuntimeError(f"Faltan datos de la estación {station_id}.")
-        series = history.loc[
-            (history["station_id"].astype(str) == station_id)
-            & (history["observed_at"] <= cutoff)
-        ].sort_values("observed_at")["demand"]
-        if len(series) < 672:
+        if history_counts[station_id] < 672:
             raise RuntimeError(f"No hay 7 días de historia utilizables para {station_id}.")
-        local_target = target_at.tz_convert("America/Bogota")
-        values = series.astype(float).to_numpy()
         rows.append(
             {
                 "station_id": station_id,
                 "horizon": horizon_minutes // 15,
                 "origin": cutoff,
-                "target_at": target["target_at"],
+                "target_at": target_at,
+                "target_at_raw": target["target_at"],
+            }
+        )
+    if len(seen) != len(targets):
+        raise RuntimeError("No se pudo construir una fila para cada target.")
+    return pd.DataFrame(rows)
+
+
+def legacy_rf_features(history: pd.DataFrame, target_rows: pd.DataFrame) -> pd.DataFrame:
+    """Features of the former Random Forest champion (artifacts with a 'pipeline')."""
+    rows: list[dict] = []
+    for target in target_rows.itertuples(index=False):
+        series = history.loc[
+            (history["station_id"].astype(str) == target.station_id)
+            & (history["observed_at"] <= target.origin)
+        ].sort_values("observed_at")["demand"]
+        local_target = target.target_at.tz_convert("America/Bogota")
+        values = series.astype(float).to_numpy()
+        rows.append(
+            {
+                "station_id": target.station_id,
+                "horizon": target.horizon,
                 "hour_sin": math.sin(2 * math.pi * local_target.hour / 24),
                 "hour_cos": math.cos(2 * math.pi * local_target.hour / 24),
                 "dow_sin": math.sin(2 * math.pi * local_target.dayofweek / 7),
@@ -493,9 +539,92 @@ def build_target_features(history: pd.DataFrame, cycle: dict) -> pd.DataFrame:
                 "rolling_96": float(values[-96:].mean()),
             }
         )
-    if len(seen) != len(targets):
-        raise RuntimeError("No se pudo construir una fila para cada target.")
     return pd.DataFrame(rows)
+
+
+def predict_cycle(champion: dict, history: pd.DataFrame, target_rows: pd.DataFrame) -> np.ndarray:
+    if "model" in champion:
+        return champion["model"].predict(history, target_rows)
+    features = legacy_rf_features(history, target_rows)
+    return champion["pipeline"].predict(features[FEATURES])
+
+
+def detect_drift(model: PulsoEnsemble, history: pd.DataFrame, cutoff: pd.Timestamp) -> pd.DataFrame:
+    """Stations whose observed/expected level stayed on the same side outside DRIFT_BAND
+    in each of the last DRIFT_WINDOWS non-overlapping windows."""
+    ratios = model.level_ratios(history, cutoff, window=DRIFT_WINDOW_STEPS, lookbacks=DRIFT_WINDOWS)
+    low, high = DRIFT_BAND
+    drifting = []
+    for station, group in ratios.groupby("station_id"):
+        values = group["ratio"].to_numpy()
+        if np.isnan(values).any():
+            continue
+        if (values > high).all() or (values < low).all():
+            drifting.append(
+                {
+                    "station_id": station,
+                    "direction": "up" if values[0] > high else "down",
+                    "ratios": [round(float(v), 3) for v in values],
+                }
+            )
+    return pd.DataFrame(drifting, columns=["station_id", "direction", "ratios"])
+
+
+def handle_drift(
+    client: Client, champion: dict, history: pd.DataFrame, cutoff: pd.Timestamp, send: bool
+) -> None:
+    """Log drifting stations to monitoring_events and retrain if the champion is old enough."""
+    if "model" not in champion:
+        return
+    drift_hours = DRIFT_WINDOWS * DRIFT_WINDOW_STEPS // 4
+    drifting = detect_drift(champion["model"], history, cutoff)
+    if drifting.empty:
+        print("Monitoreo de drift: niveles dentro de lo esperado.")
+        return
+    summary = ", ".join(f"{r.station_id} ({r.direction}, {r.ratios})" for r in drifting.itertuples())
+    print(f"Monitoreo de drift: nivel fuera de {DRIFT_BAND} por {drift_hours} h en {summary}")
+    if not send:
+        return
+    client.table("monitoring_events").insert(
+        [
+            {
+                "model_version": champion["model_version"],
+                "event_type": "data_drift",
+                "severity": "warning",
+                "station_id": row.station_id,
+                "details": {
+                    "cutoff": cutoff.isoformat(),
+                    "direction": row.direction,
+                    "level_ratios_newest_first": row.ratios,
+                    "band": list(DRIFT_BAND),
+                    "window_hours": drift_hours,
+                },
+                "decision": "ajuste de nivel activo; reentrenar",
+            }
+            for row in drifting.itertuples()
+        ]
+    ).execute()
+    training_end = pd.Timestamp(champion["training_data_end"])
+    if training_end.tzinfo is None:
+        training_end = training_end.tz_localize("UTC")
+    if cutoff - training_end < DRIFT_RETRAIN_MIN_AGE:
+        print("El champion es reciente; no se reentrena por drift todavía.")
+        return
+    try:
+        train_and_promote(client, cutoff)
+        decision = "reentrenado y promovido"
+    except Exception as exc:
+        decision = f"reentrenamiento no promovido: {exc if isinstance(exc, RuntimeError) else type(exc).__name__}"
+    print(f"Drift: {decision}")
+    client.table("monitoring_events").insert(
+        {
+            "model_version": champion["model_version"],
+            "event_type": "retraining_decision",
+            "severity": "info",
+            "details": {"cutoff": cutoff.isoformat(), "stations": drifting["station_id"].tolist()},
+            "decision": decision[:500],
+        }
+    ).execute()
 
 
 def persist_cycle(client: Client, cycle: dict) -> None:
@@ -580,16 +709,15 @@ def run_forecast(client: Client, send: bool) -> None:
             "Datos desactualizados al cutoff para estaciones: "
             + ", ".join(map(str, too_stale.index.tolist()))
         )
-    features = build_target_features(history, cycle)
-    estimator = champion["pipeline"]
-    raw_values = estimator.predict(features[FEATURES])
+    target_rows = cycle_target_rows(history, cycle)
+    raw_values = predict_cycle(champion, history, target_rows)
     predictions = [
         {
             "station_id": str(row.station_id),
-            "target_at": str(row.target_at),
+            "target_at": str(row.target_at_raw),
             "value": round(max(0.0, float(value)), 3),
         }
-        for row, value in zip(features.itertuples(index=False), raw_values, strict=True)
+        for row, value in zip(target_rows.itertuples(index=False), raw_values, strict=True)
     ]
     expected = {
         (str(row["station_id"]), pd.Timestamp(row["target_at"]).isoformat())
@@ -628,6 +756,7 @@ def run_forecast(client: Client, send: bool) -> None:
             f"{len(predictions)}/{cycle['expected_predictions']} targets listos; no se envió."
         )
         print(json.dumps(predictions[:3], ensure_ascii=False))
+        handle_drift(client, champion, history, cutoff, send=False)
         return
 
     try:
@@ -703,6 +832,11 @@ def run_forecast(client: Client, send: bool) -> None:
         f"Entrega {status}: {submission_id}; "
         f"predicciones {receipt.get('predictions_received')}/{receipt.get('expected_predictions')}"
     )
+    # Monitoring runs after the submission is stored so it can never delay or block it.
+    try:
+        handle_drift(client, champion, history, cutoff, send=True)
+    except Exception as exc:
+        print(f"Monitoreo de drift falló ({type(exc).__name__}); la entrega ya quedó registrada.")
 
 
 def main() -> None:

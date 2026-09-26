@@ -1,7 +1,14 @@
-name: Train and promote Random Forest
+name: Train and promote forecast model
 
 on:
+  schedule:
+    # Daily at 00:07 Bogotá (05:07 UTC); drift alerts can also retrain from the hourly job.
+    - cron: "7 5 * * *"
   workflow_dispatch:
+
+concurrency:
+  group: pulso-transmi-cycle
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -25,5 +32,5 @@ jobs:
         run: python -m pip install -r requirements-pipeline.txt
       - name: Sync latest released observations
         run: python analysis/pulso_pipeline.py sync
-      - name: Train, validate, save joblib and promote only if it beats weekly naive
+      - name: Train ensemble, validate against weekly naive and RF, save joblib and promote only if it wins
         run: python analysis/pulso_pipeline.py train

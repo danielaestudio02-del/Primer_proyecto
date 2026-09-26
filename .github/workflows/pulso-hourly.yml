@@ -15,7 +15,7 @@ permissions:
 jobs:
   sync-and-forecast:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 12
     env:
       PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
