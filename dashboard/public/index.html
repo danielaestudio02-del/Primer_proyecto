@@ -105,7 +105,8 @@
         `${status.stations} estaciones · ${Number(status.observation_rows).toLocaleString("es-CO")} observaciones`;
 
       document.getElementById("kpi-acc").textContent = accuracy.official_accuracy == null ? "—" : `${fmtNum(accuracy.official_accuracy)}%`;
-      document.getElementById("kpi-acc-note").textContent = `${accuracy.evaluated_targets} targets · ${accuracy.cycles} ciclos`;
+      const pending = accuracy.pending_targets ? ` · ${accuracy.pending_targets} esperando dato real` : "";
+      document.getElementById("kpi-acc-note").textContent = `${accuracy.evaluated_targets} targets · ${accuracy.cycles} ciclos${pending}`;
       document.getElementById("kpi-wape").textContent = fmtNum(accuracy.mean_station_wape, 3);
 
       const champ = champion[0];
