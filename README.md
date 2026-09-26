@@ -28,6 +28,10 @@ La sincronización continua y los envíos por ciclo están en `analysis/pulso_pi
 
 La migración `202609250001_results_api.sql` expone los resultados mediante funciones RPC `api_*` de solo lectura, sin abrir las tablas. El dashboard en `dashboard/` las consume a través de una función serverless de Vercel. Consulta [la guía de despliegue](reports/despliegue_vercel.md).
 
+## Dashboard en Vercel
+
+La migración `202609250001_results_api.sql` expone los resultados mediante funciones RPC `api_*` de solo lectura, sin abrir las tablas. El dashboard en `dashboard/` las consume a través de una función serverless de Vercel. Consulta [la guía de despliegue](reports/despliegue_vercel.md).
+
 ## Estado
 
 Los resultados actuales son exploratorios y usan datos sintéticos de arranque. La evaluación de competencia debe seguir el protocolo y los ciclos publicados por el curso.
