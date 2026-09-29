@@ -1,33 +1,254 @@
-# Pulso TransMi — Taller 1, versión 1
+# 🚇 Pulso TransMi — Pronóstico de demanda por estación
 
-Análisis exploratorio y comparación inicial de modelos para la serie temporal de demanda por estación de TransMilenio.
+Solución MLOps para el reto **Pulso TransMi**: pronosticar la demanda de 12 estaciones de TransMilenio cada 15 minutos (horizontes de +15, +30, +45 y +60 min), enviar las predicciones automáticamente en cada ciclo y monitorear el desempeño.
 
-## Contenido
+| | |
+|---|---|
+| 🤖 **Modelo en producción** | Ensamble **65% Prophet + 35% LightGBM** con ajuste de nivel de 2 h |
+| 📈 **Validación con datos reales de la competencia** | **85,8%** ensamble · 83,8% Random Forest · 80,7% naive semanal |
+| 🔁 **Automatización** | Envíos cada ciclo · reentrenamiento diario · reentrenamiento por drift |
+| 📊 **Tablero** | Vercel + API de solo lectura en Supabase |
 
-- `analysis/`: scripts de análisis exploratorio y comparación de baselines.
-- `data/starter/`: conjunto público de arranque proporcionado para el taller.
-- `reports/`: resultados, protocolo de validación y configuración de Supabase.
-- `supabase/migrations/`: esquema inicial de PostgreSQL/Supabase y API de resultados de solo lectura.
-- `dashboard/`: dashboard de resultados para desplegar en Vercel.
+> 💡 Los diagramas usan [Mermaid](https://mermaid.js.org/). GitHub los dibuja automáticamente. En **Visual Studio Code**, instala la extensión *Markdown Preview Mermaid Support* y abre la vista previa con `Ctrl+Shift+V`.
 
-## Reproducibilidad
+---
 
-Los análisis locales usan Python. Para instalar las dependencias del cargador de Supabase:
+## 🗺️ Arquitectura
 
-```bash
-pip install -r requirements-supabase.txt
+```mermaid
+flowchart LR
+    API["🌐 API Pulso TransMi<br/>(curso)"]
+
+    subgraph GH["⚙️ GitHub Actions"]
+        H["pulso-hourly.yml<br/>cada 10 min"]
+        T["train-random-forest.yml<br/>diario 00:07 Bogotá"]
+    end
+
+    subgraph SB["🗄️ Supabase"]
+        DB[("PostgreSQL<br/>observaciones · ciclos<br/>entregas · métricas · drift")]
+        ST[("Storage<br/>model-artifacts/*.joblib")]
+        RPC["API solo lectura<br/>funciones api_*"]
+    end
+
+    subgraph VC["▲ Vercel"]
+        PX["/api/pulso<br/>proxy serverless"]
+        UI["📊 Tablero"]
+    end
+
+    API -- "stream de observaciones<br/>+ ciclo abierto" --> H
+    H -- "48 predicciones" --> API
+    H <--> DB
+    H -- "carga champion" --> ST
+    T <--> DB
+    T -- "guarda joblib" --> ST
+    DB --> RPC --> PX --> UI
 ```
 
-Las credenciales locales van en `.env.local` y no deben subirse al repositorio. Usa `.env.example` como referencia sin agregar secretos reales.
+---
 
-Para repetir la comparación de un solo corte, ejecuta `python analysis/compare_baselines.py --source supabase`. Para comparar persistencia, los naives diario/semanal, Random Forest, XGBoost y el ensamble de producción (Prophet + LightGBM) en tres semanas temporales, instala `python -m pip install -r requirements-modeling.txt` y ejecuta `python analysis/backtest_models.py --source supabase`.
+## ⏱️ Qué pasa cada hora
 
-La sincronización continua y los envíos por ciclo están en `analysis/pulso_pipeline.py`. Requieren un bucket privado de Supabase Storage llamado `model-artifacts` y los GitHub Actions Secrets `PULSO_API_KEY`, `SUPABASE_URL` y `SUPABASE_SECRET_KEY`. Consulta [la guía de operación](reports/operacion_envios_v1.md) para la preparación y el primer entrenamiento. El workflow revisa ciclos cada 10 minutos; entrena/promueve una vez al día (o ante drift) y solo entrega si hay ciclo abierto y un champion válido. El modelo de producción es un ensamble 65% Prophet + 35% LightGBM con ajuste de nivel de 2 horas, empaquetado en un `.joblib` (ver `analysis/ensemble_model.py` y [el backtest](reports/backtest_modelos_v1.md)).
+```mermaid
+sequenceDiagram
+    autonumber
+    participant GA as GitHub Actions
+    participant API as API del curso
+    participant SB as Supabase
+    GA->>API: Pide observaciones nuevas (stream)
+    GA->>SB: Guarda observaciones (upsert, sin duplicados)
+    GA->>API: ¿Hay ciclo abierto?
+    alt Ciclo abierto y sin entrega
+        GA->>SB: Descarga el joblib del champion
+        GA->>GA: Prophet + LightGBM + ajuste de nivel (últimas 2 h)
+        GA->>API: Envía 48 predicciones (12 estaciones × 4 horizontes)
+        API-->>GA: Recibo "accepted"
+        GA->>SB: Guarda recibo y predicciones
+        GA->>GA: Revisa drift (demanda real vs. esperada)
+        opt Drift sostenido 12 h y champion > 6 h
+            GA->>GA: Reentrena y promueve si gana
+        end
+    else Sin ciclo o ya enviado
+        GA-->>GA: Solo sincroniza
+    end
+```
 
-## Dashboard en Vercel
+---
 
-La migración `202609250001_results_api.sql` expone los resultados mediante funciones RPC `api_*` de solo lectura, sin abrir las tablas. El dashboard en `dashboard/` las consume a través de una función serverless de Vercel. Consulta [la guía de despliegue](reports/despliegue_vercel.md).
+## 🧠 El modelo
 
-## Estado
+```mermaid
+flowchart TB
+    D["Historial de demanda<br/>(hasta el cutoff)"] --> P & L
 
-Los resultados actuales son exploratorios y usan datos sintéticos de arranque. La evaluación de competencia debe seguir el protocolo y los ciclos publicados por el curso.
+    subgraph P["Prophet por estación · 65%"]
+        P1["Perfil diario + semanal<br/>promediado de muchas semanas"] --> P2["× razón real/esperada<br/>de las últimas 2 h"]
+    end
+
+    subgraph L["LightGBM global · 35%"]
+        L1["Rezagos · pendientes<br/>misma hora ayer / semana pasada<br/>perfiles promediados de 4 semanas"]
+    end
+
+    P2 --> E["Ensamble<br/>0,65 · Prophet + 0,35 · LightGBM"]
+    L1 --> E
+    E --> O["Predicción +15 / +30 / +45 / +60 min"]
+```
+
+**Por qué funciona**
+- **El perfil promediado quita ruido.** Un solo valor de "la semana pasada" es ruidoso; Prophet promedia muchas semanas y obtiene la forma típica del día.
+- **LightGBM reacciona a lo reciente** y los dos se equivocan de forma distinta, así que al combinarlos los errores se compensan.
+- **El ajuste de nivel responde al drift.** Si en las últimas 2 horas llega un 20% más de gente de lo esperado, la parte de Prophet sube un 20%. Con 2 horas se filtra el ruido y el cambio igual se detecta en 2–3 actualizaciones.
+- **Todo va en un solo `.joblib`**: 12 modelos Prophet (en JSON), LightGBM, pesos, variables y métricas de validación.
+
+---
+
+## 📊 Resultados
+
+### Backtest con datos de arranque (3 semanas)
+
+| Modelo | Accuracy media | Peor semana | Desv. estándar |
+|---|---:|---:|---:|
+| **Ensamble Prophet + LightGBM** | **87,88%** | 87,58% | 0,28 pp |
+| Random Forest (modelo anterior) | 85,16% | 84,93% | 0,38 pp |
+| XGBoost | 84,99% | 84,60% | 0,39 pp |
+| Naive semanal | 83,25% | 83,03% | 0,31 pp |
+| Naive diario | 77,50% | 76,83% | 0,59 pp |
+| Persistencia | 74,43% | 74,26% | 0,16 pp |
+
+![Accuracy promedio por modelo](reports/figures/backtest_modelos_accuracy.png)
+
+### Validación con datos reales de la competencia (últimos 7 días)
+
+| Entrenamiento | Ensamble | Random Forest | Naive semanal |
+|---|---:|---:|---:|
+| 26/09 — primer champion del ensamble | **85,84%** | 83,84% | 80,72% |
+| 27/09 — reentrenamiento automático por drift | **85,61%** | 83,43% | 80,21% |
+
+### Robustez ante drift (simulación de +20% de demanda repentina)
+
+| Modelo | Sin drift | Con drift |
+|---|---:|---:|
+| Ensamble sin ajuste de nivel | 87,87% | 81,40% ❌ |
+| **Ensamble con ajuste de nivel (producción)** | **88,18%** | **87,90%** ✅ |
+
+### Modelos que se probaron y se descartaron
+
+| Idea | Resultado | Decisión |
+|---|---|---|
+| Ridge / GAM | ~85,2% | Relación casi lineal, pero sin ganancia |
+| SARIMA (diferencia semanal) | 83,5% | Hereda el ruido de una sola semana |
+| Predecir el residuo sobre el naive | 86,0% | Peor que predecir directo |
+| Un modelo por horizonte | 85,9% | Peor que un modelo global |
+| Stacking (Prophet como variable de LightGBM) | 87,5% | Peor que el promedio ponderado |
+| Ajuste de nivel con 15 min | 86,3% | Reacciona al ruido |
+
+---
+
+## 🧭 Cronología del proyecto
+
+```mermaid
+timeline
+    title Lo que construimos
+    Base : EDA y baselines (persistencia, naive diario / semanal)
+         : Random Forest + XGBoost con backtesting temporal
+         : Pipeline en GitHub Actions + Supabase (Random Forest)
+    Tablero : API de solo lectura en Supabase (funciones api_*)
+            : Tablero en Vercel con proxy serverless
+            : Corrección del reloj virtual de la competencia
+    Modelo : Diagnóstico del techo del 86%
+           : Pruebas de LightGBM, Ridge, GAM, Prophet y SARIMA
+           : Ensamble Prophet + LightGBM empaquetado en joblib
+    Operación : Ajuste de nivel y alerta de drift calibrados
+              : Reentrenamiento diario y por drift
+              : Ensamble en producción desde el 26/09
+```
+
+---
+
+## 🛡️ Monitoreo de drift
+
+Después de cada entrega se compara la demanda real con la esperada por estación:
+
+| Razón real / esperada | Qué significa | Qué hace el sistema |
+|---|---|---|
+| 0,85 – 1,15 | Normal | Nada |
+| Fuera del rango por poco tiempo | Evento puntual | El ajuste de nivel lo corrige |
+| Fuera del rango **12 h seguidas** (3 ventanas de 4 h) | Drift real | Registra `data_drift` en `monitoring_events` y reentrena si el champion tiene más de 6 h |
+
+Con los datos de arranque, la regla da **~0,6% de falsas alarmas** por estación-hora y detecta **~79%** de los cambios de +20%. En la competencia ya detectó drift real en la estación **05100** (demanda a ~50% de lo normal) y en la **06000** (+20–30%).
+
+---
+
+## 📁 Estructura del repositorio
+
+```
+Primer_proyecto/
+├── analysis/
+│   ├── ensemble_model.py        # 🧠 Modelo de producción (PulsoEnsemble)
+│   ├── pulso_pipeline.py        # ⚙️ sync / train / forecast + drift
+│   ├── backtest_models.py       # 📏 Backtest de 3 semanas (incluye el ensamble)
+│   ├── forecasting_core.py      # Variables y métrica oficial compartidas
+│   ├── compare_baselines.py     # Comparación de un solo corte
+│   ├── eda_starter.py           # Análisis exploratorio
+│   └── load_starter_to_supabase.py
+├── dashboard/                   # ▲ Tablero para Vercel
+│   ├── api/pulso.js             #   Proxy a las funciones api_* de Supabase
+│   └── public/index.html        #   Página con Chart.js
+├── supabase/migrations/
+│   ├── 202609220001_initial_schema.sql        # Tablas con RLS
+│   ├── 202609250001_results_api.sql           # API de resultados de solo lectura
+│   └── 202609260001_results_api_virtual_clock.sql  # Ventanas según el reloj virtual
+├── .github/workflows/
+│   ├── pulso-hourly.yml         # Cada 10 min: sincroniza, envía, monitorea
+│   └── train-random-forest.yml  # Diario: entrena y promueve el champion
+├── reports/                     # EDA, backtests, protocolo y guías
+└── data/starter/                # Datos públicos de arranque del curso
+```
+
+---
+
+## 🚀 Cómo operar
+
+### Automático (no requiere nada)
+- **Cada 10 minutos:** sincroniza, envía si hay ciclo abierto y revisa drift.
+- **Cada día a las 00:07 (Bogotá):** reentrena y promueve el champion solo si le gana al naive semanal y al Random Forest.
+
+### Manual
+| Quiero… | Cómo |
+|---|---|
+| Entrenar ya | GitHub → **Actions → Train and promote forecast model → Run workflow** |
+| Ver resultados | Tablero de Vercel (accuracy, champion, entregas, predicción vs. real) |
+| Revisar una ejecución | GitHub → **Actions** → abrir la ejecución → log del paso *Sync stream…* |
+| Correr el backtest local | `pip install -r requirements-modeling.txt` y `python analysis/backtest_models.py --source local` |
+
+### Volver al modelo anterior
+- **Sin tocar código:** en el SQL Editor de Supabase, marca como `champion` la versión `rf-…` en `model_versions` (el pipeline sigue sabiendo usar joblibs de Random Forest). El entrenamiento diario puede volver a promover el ensamble si gana.
+- **Definitivo:** revertir el PR #2 en GitHub.
+
+---
+
+## 🔐 Configuración y secretos
+
+| Dónde | Variable | Uso |
+|---|---|---|
+| GitHub Actions Secrets | `PULSO_API_KEY` | Llave de la API del curso |
+| GitHub Actions Secrets | `SUPABASE_URL`, `SUPABASE_SECRET_KEY` | Escritura en Supabase (solo backend) |
+| Vercel | `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY` | Lectura de la API `api_*` (clave pública) |
+| Local | `.env.local` | Copia de `.env.example`; **nunca** se sube al repositorio |
+
+- Las tablas de Supabase tienen RLS activo y no son accesibles para `anon`. El tablero solo usa las funciones `api_*`, que devuelven resultados agregados.
+- Se necesita un bucket privado de Supabase Storage llamado `model-artifacts`.
+
+Guías detalladas:
+- [Operación de envíos](reports/operacion_envios_v1.md)
+- [Montaje de Supabase](reports/supabase_setup.md)
+- [Despliegue en Vercel](reports/despliegue_vercel.md)
+- [Protocolo de validación](reports/protocolo_validacion_v1.md)
+- [Backtest de modelos](reports/backtest_modelos_v1.md)
+
+---
+
+## ⚠️ Limitaciones conocidas
+
+- Ante caídas muy fuertes de demanda (por ejemplo, 05100 a ~50%), el ensamble resiste mucho mejor que el naive, pero pierde precisión: en simulación, ~60% de accuracy en esa estación.
+- La accuracy **acumulada** del ranking promedia todos los ciclos desde el 25/09, incluidos los del Random Forest; la mejora del ensamble se ve antes en la vista de **últimos ciclos**.
+- Los backtests usan los datos sintéticos de arranque; la referencia final es el desempeño en los ciclos oficiales.
