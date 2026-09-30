@@ -51,6 +51,15 @@ DRIFT_BAND = (0.85, 1.15)
 DRIFT_WINDOW_STEPS = 16
 DRIFT_WINDOWS = 3
 DRIFT_RETRAIN_MIN_AGE = pd.Timedelta(hours=6)
+# Performance monitoring on the submissions already evaluated: compare the mean
+# accuracy of the last PERF_WINDOW_CYCLES cycles with the previous window (trend,
+# not a single bad cycle) and with the weekly naive scored on the same targets.
+PERF_WINDOW_CYCLES = 6
+PERF_DROP_PP = 3.0
+# Promotion: a candidate trained without the last RECENT_EVAL_HOURS must beat what
+# production actually submitted in that window (at least MIN_RECENT_CYCLES cycles).
+RECENT_EVAL_HOURS = 24
+MIN_RECENT_CYCLES = 6
 # Exit code for transient network failures; the workflows retry only this code.
 EXIT_TRANSIENT = 75
 
@@ -293,9 +302,75 @@ def hourly_origins(frame: pd.DataFrame) -> pd.DatetimeIndex:
     return times[times.tz_convert("America/Bogota").minute == 0]
 
 
-def validate_and_fit(history: pd.DataFrame, cutoff: pd.Timestamp) -> dict:
-    """Temporal holdout (last 7 local days) for the ensemble vs. weekly naive and a
-    Random Forest challenger; if the ensemble beats both, refit it up to the cutoff."""
+def official_accuracy(frame: pd.DataFrame, column: str) -> float | None:
+    """Course metric: per-station WAPE -> accuracy, averaged over stations."""
+    scored = frame[frame["y"].notna() & frame[column].notna()]
+    if scored.empty:
+        return None
+    grouped = scored.assign(ae=(scored["y"] - scored[column]).abs()).groupby("station_id").agg(
+        ae=("ae", "sum"), y=("y", "sum")
+    )
+    return float((100 * (1 - grouped["ae"] / grouped["y"].clip(lower=1))).clip(lower=0).mean())
+
+
+def submitted_targets(client: Client, history: pd.DataFrame) -> pd.DataFrame:
+    """Every target of the latest official submission per cycle, with the value that
+    was submitted, the observed demand (NaN until released) and the weekly naive."""
+    subs = pd.DataFrame(paged_rows(
+        client, "submissions",
+        "submission_id,cycle_id,model_version,status,is_official,accepted_at,attempt,data_cutoff",
+    ))
+    if subs.empty:
+        return pd.DataFrame()
+    subs = subs[subs["is_official"].astype(bool) & subs["status"].isin(["accepted", "duplicate"])]
+    subs = subs.sort_values(["cycle_id", "accepted_at", "attempt"]).groupby("cycle_id").tail(1)
+    preds = pd.DataFrame(paged_rows(client, "predictions", "submission_id,station_id,target_at,predicted_value"))
+    if preds.empty or subs.empty:
+        return pd.DataFrame()
+    rows = preds.merge(subs, on="submission_id")
+    rows["station_id"] = rows["station_id"].astype(str)
+    rows["origin"] = pd.to_datetime(rows["data_cutoff"], utc=True)
+    rows["target_at"] = pd.to_datetime(rows["target_at"], utc=True)
+    rows["horizon"] = ((rows["target_at"] - rows["origin"]) / pd.Timedelta(minutes=15)).round().astype(int)
+    lookup = history.assign(station_id=history["station_id"].astype(str)).set_index(
+        ["station_id", "observed_at"]
+    )["demand"].astype(float)
+    def at(times: pd.Series) -> np.ndarray:
+        return lookup.reindex(pd.MultiIndex.from_arrays([rows["station_id"], times])).to_numpy()
+    rows["y"] = at(rows["target_at"])
+    rows["naive"] = at(rows["target_at"] - pd.Timedelta(days=7))
+    return rows
+
+
+def cycle_scores(targets: pd.DataFrame) -> pd.DataFrame:
+    """Accuracy per cycle (only for fully evaluated cycles) next to the weekly naive."""
+    records = []
+    for cycle_id, frame in targets.groupby("cycle_id"):
+        evaluated = int(frame["y"].notna().sum())
+        complete = evaluated == len(frame)
+        records.append({
+            "cycle_id": cycle_id,
+            "origin": frame["origin"].iloc[0],
+            "model_version": frame["model_version"].iloc[0],
+            "targets": len(frame),
+            "evaluated": evaluated,
+            "accuracy": official_accuracy(frame, "predicted_value") if complete else None,
+            "naive_accuracy": official_accuracy(frame, "naive") if complete else None,
+        })
+    return pd.DataFrame(records).sort_values("origin") if records else pd.DataFrame()
+
+
+def validate_and_fit(
+    history: pd.DataFrame, cutoff: pd.Timestamp, recent: pd.DataFrame | None = None
+) -> dict:
+    """Decide whether a freshly trained ensemble should become champion.
+
+    1. Temporal holdout (last 7 local days): an ensemble trained before the holdout
+       must beat the weekly naive and a Random Forest trained on the same data.
+    2. Recent window (last RECENT_EVAL_HOURS with released demand): an ensemble
+       trained only with data before the window must beat what production actually
+       submitted for those same targets. Skipped if fewer than MIN_RECENT_CYCLES.
+    Only if both pass is the ensemble refit with all data up to the cutoff."""
     origins = hourly_origins(history)
     if len(origins) < 2:
         raise RuntimeError("No hay suficientes orígenes horarios para entrenar.")
@@ -336,14 +411,48 @@ def validate_and_fit(history: pd.DataFrame, cutoff: pd.Timestamp) -> dict:
     best_reference = max(
         metrics["random_forest"]["official_accuracy"], metrics["weekly_naive"]["official_accuracy"]
     )
+    reasons: list[str] = []
     if metrics["ensemble"]["official_accuracy"] <= best_reference:
-        raise RuntimeError(
-            "El ensamble no superó al naive semanal y al Random Forest en el holdout reciente; "
-            "se conserva el champion actual y no se promueve este candidato."
-        )
+        reasons.append("no superó al naive semanal y al Random Forest en el holdout de 7 días")
 
+    if recent is not None and not recent.empty:
+        window = recent[recent["y"].notna()]
+        window = window[window.groupby("cycle_id")["y"].transform("size") == window.groupby("cycle_id")["station_id"].transform("size")]
+        cycles = window["cycle_id"].nunique()
+        if cycles >= MIN_RECENT_CYCLES:
+            window = window.copy()
+            window_start = window["origin"].min()
+            challenger_recent = PulsoEnsemble().fit(history, window_start - pd.Timedelta(minutes=15))
+            window["candidate"] = challenger_recent.predict(history, window)
+            metrics["recent_window"] = {
+                "start": window_start.isoformat(),
+                "end": window["target_at"].max().isoformat(),
+                "cycles": int(cycles),
+                "targets": int(len(window)),
+                "candidate": official_accuracy(window, "candidate"),
+                "production": official_accuracy(window, "predicted_value"),
+                "weekly_naive": official_accuracy(window, "naive"),
+                "production_versions": sorted(window["model_version"].unique().tolist()),
+            }
+            recent_metrics = metrics["recent_window"]
+            print(
+                f"Ventana reciente ({cycles} ciclos): candidato={recent_metrics['candidate']:.2f}%, "
+                f"producción={recent_metrics['production']:.2f}%"
+            )
+            if recent_metrics["candidate"] <= recent_metrics["production"]:
+                reasons.append("no superó a lo que producción envió en la ventana reciente")
+        else:
+            metrics["recent_window"] = {"skipped": f"solo {cycles} ciclos evaluados en la ventana reciente"}
+    else:
+        metrics["recent_window"] = {"skipped": "sin entregas evaluadas en la ventana reciente"}
+
+    if reasons:
+        return {"promote": False, "reason": "; ".join(reasons), "metrics": metrics,
+                "validation_start": validation_start}
     model = PulsoEnsemble().fit(history, cutoff)
     return {
+        "promote": True,
+        "reason": "superó al naive semanal y al Random Forest (7 días) y a producción en la ventana reciente",
         "model": model,
         "metrics": metrics,
         "validation_start": validation_start,
@@ -352,7 +461,7 @@ def validate_and_fit(history: pd.DataFrame, cutoff: pd.Timestamp) -> dict:
     }
 
 
-def train_and_promote(client: Client, cutoff: pd.Timestamp) -> dict:
+def train_and_promote(client: Client, cutoff: pd.Timestamp) -> dict | None:
     history = load_observations(client, cutoff)
     if history.empty:
         raise RuntimeError("No hay datos anteriores al cutoff para entrenar.")
@@ -364,7 +473,29 @@ def train_and_promote(client: Client, cutoff: pd.Timestamp) -> dict:
             + ", ".join(map(str, too_stale.index.tolist()))
         )
 
-    result = validate_and_fit(history, cutoff)
+    targets = submitted_targets(client, history)
+    recent = None
+    if not targets.empty:
+        recent = targets[targets["origin"] >= cutoff - pd.Timedelta(hours=RECENT_EVAL_HOURS)]
+        recent = recent[recent["target_at"] <= cutoff]
+    result = validate_and_fit(history, cutoff, recent)
+    if not result["promote"]:
+        print(f"Se conserva el champion actual: el candidato {result['reason']}.")
+        client.table("training_runs").insert(
+            {
+                "model_family": MODEL_FAMILY,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "training_data_start": history["observed_at"].min().isoformat(),
+                "training_data_end": cutoff.isoformat(),
+                "validation_start": result["validation_start"].isoformat(),
+                "validation_end": cutoff.isoformat(),
+                "status": "completed",
+                "parameters": PulsoEnsemble().get_config(),
+                "metrics": result["metrics"],
+                "notes": f"Candidato no promovido: {result['reason']}.",
+            }
+        ).execute()
+        return None
     model = result["model"]
     validation_start = result["validation_start"]
     training_data_start = result["training_data_start"]
@@ -393,7 +524,7 @@ def train_and_promote(client: Client, cutoff: pd.Timestamp) -> dict:
             "code_commit": git_commit,
             "parameters": model.get_config(),
             "metrics": result["metrics"],
-            "notes": "Ensamble validado temporalmente contra naive semanal y Random Forest.",
+            "notes": f"Candidato promovido: {result['reason']}.",
         }
     ).execute()
     training_run_id = run_result.data[0]["training_run_id"]
@@ -414,6 +545,7 @@ def train_and_promote(client: Client, cutoff: pd.Timestamp) -> dict:
     }
     buffer = io.BytesIO()
     joblib.dump(artifact, buffer, compress=3)
+    artifact_sha256 = hashlib.sha256(buffer.getvalue()).hexdigest()
     try:
         client.storage.from_(ARTIFACT_BUCKET).upload(
             artifact_path,
@@ -437,8 +569,10 @@ def train_and_promote(client: Client, cutoff: pd.Timestamp) -> dict:
             "features": ENSEMBLE_FEATURES,
             "validation_metrics": artifact["validation_metrics"],
             "notes": (
-                "Ensamble 65% Prophet (ajuste de nivel 2 h) + 35% LightGBM; superó al naive "
-                "semanal y al Random Forest en el holdout temporal reciente."
+                "Ensamble adaptativo (Prophet con ajuste de nivel, LightGBM, ayer ajustado y "
+                f"persistencia, pesos por error de las últimas 24 h). Promovido: {result['reason']}. "
+                f"Datos {training_data_start.isoformat()} a {training_data_end.isoformat()}; "
+                f"joblib sha256 {artifact_sha256}."
             ),
         }
     ).execute()
@@ -449,7 +583,7 @@ def train_and_promote(client: Client, cutoff: pd.Timestamp) -> dict:
     client.table("model_versions").update(
         {"status": "champion", "promoted_at": datetime.now(timezone.utc).isoformat()}
     ).eq("model_version", version).execute()
-    print(f"Champion promovido: {version}; artefacto: {artifact_uri}")
+    print(f"Champion promovido: {version}; artefacto: {artifact_uri} (sha256 {artifact_sha256[:12]}…)")
     return artifact
 
 
@@ -613,27 +747,111 @@ def handle_drift(
             for row in drifting.itertuples()
         ]
     ).execute()
+    evaluate_candidate(
+        client, champion, cutoff, "data_drift", {"stations": drifting["station_id"].tolist()}
+    )
+
+
+def evaluate_candidate(
+    client: Client, champion: dict, cutoff: pd.Timestamp, trigger: str, details: dict
+) -> None:
+    """Train and evaluate a candidate after a monitoring trigger (not more often than
+    DRIFT_RETRAIN_MIN_AGE) and record the decision and its evidence."""
     training_end = pd.Timestamp(champion["training_data_end"])
     if training_end.tzinfo is None:
         training_end = training_end.tz_localize("UTC")
     if cutoff - training_end < DRIFT_RETRAIN_MIN_AGE:
-        print("El champion es reciente; no se reentrena por drift todavía.")
+        print(f"{trigger}: el champion tiene menos de {DRIFT_RETRAIN_MIN_AGE}; no se evalúa un candidato todavía.")
         return
+    # Hysteresis: at most one evaluation per DRIFT_RETRAIN_MIN_AGE, even if the candidate lost.
+    last = (
+        client.table("monitoring_events")
+        .select("detected_at")
+        .eq("event_type", "retraining_decision")
+        .order("detected_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if last.data:
+        since = pd.Timestamp.now(tz="UTC") - pd.Timestamp(last.data[0]["detected_at"])
+        if since < DRIFT_RETRAIN_MIN_AGE:
+            print(f"{trigger}: última evaluación hace {since}; se espera {DRIFT_RETRAIN_MIN_AGE} entre evaluaciones.")
+            return
     try:
-        train_and_promote(client, cutoff)
-        decision = "reentrenado y promovido"
+        promoted = train_and_promote(client, cutoff)
+        decision = "candidato promovido" if promoted else "candidato evaluado; se conserva el champion"
     except Exception as exc:
-        decision = f"reentrenamiento no promovido: {exc if isinstance(exc, RuntimeError) else type(exc).__name__}"
-    print(f"Drift: {decision}")
+        decision = f"evaluación fallida: {exc if isinstance(exc, RuntimeError) else type(exc).__name__}"
+    print(f"{trigger}: {decision}")
     client.table("monitoring_events").insert(
         {
             "model_version": champion["model_version"],
             "event_type": "retraining_decision",
             "severity": "info",
-            "details": {"cutoff": cutoff.isoformat(), "stations": drifting["station_id"].tolist()},
+            "details": {"cutoff": cutoff.isoformat(), "trigger": trigger, **details},
             "decision": decision[:500],
         }
     ).execute()
+
+
+def monitor_performance(
+    client: Client, champion: dict, history: pd.DataFrame, cutoff: pd.Timestamp, send: bool
+) -> None:
+    """Accuracy of the evaluated submissions (trend over cycles, not one bad result),
+    compared with the weekly naive on the same targets, plus submission coverage."""
+    targets = submitted_targets(client, history)
+    scores = cycle_scores(targets) if not targets.empty else pd.DataFrame()
+    done = scores[scores["accuracy"].notna()] if not scores.empty else scores
+    events: list[dict] = []
+
+    if len(done) >= 2 * PERF_WINDOW_CYCLES:
+        last = done.tail(PERF_WINDOW_CYCLES)
+        prev = done.iloc[-2 * PERF_WINDOW_CYCLES:-PERF_WINDOW_CYCLES]
+        evidence = {
+            "last_cycles": last["cycle_id"].tolist(),
+            "last_mean_accuracy": round(float(last["accuracy"].mean()), 3),
+            "previous_mean_accuracy": round(float(prev["accuracy"].mean()), 3),
+            "last_mean_naive_accuracy": round(float(last["naive_accuracy"].mean()), 3),
+            "pending_cycles": int((scores["accuracy"].isna()).sum()),
+        }
+        print(
+            f"Desempeño: últimos {PERF_WINDOW_CYCLES} ciclos {evidence['last_mean_accuracy']:.2f}% "
+            f"(anteriores {evidence['previous_mean_accuracy']:.2f}%, naive semanal "
+            f"{evidence['last_mean_naive_accuracy']:.2f}%)"
+        )
+        reasons = []
+        if evidence["last_mean_accuracy"] < evidence["previous_mean_accuracy"] - PERF_DROP_PP:
+            reasons.append(f"caída de más de {PERF_DROP_PP} pp frente a los {PERF_WINDOW_CYCLES} ciclos anteriores")
+        if evidence["last_mean_accuracy"] < evidence["last_mean_naive_accuracy"]:
+            reasons.append("peor que el naive semanal en los mismos targets")
+        if reasons:
+            evidence["reasons"] = reasons
+            events.append({"event_type": "performance_drift", "severity": "warning", "details": evidence,
+                           "decision": "evaluar un candidato"})
+    else:
+        print(f"Desempeño: {len(done)} ciclos evaluados; se necesitan {2 * PERF_WINDOW_CYCLES} para comparar tendencias.")
+
+    # Coverage: cycles seen by the pipeline that closed without an official submission.
+    cycles = pd.DataFrame(paged_rows(client, "forecast_cycles", "cycle_id,data_cutoff,closes_at"))
+    if not cycles.empty:
+        submitted = set(scores["cycle_id"]) if not scores.empty else set()
+        closes = pd.to_datetime(cycles["closes_at"], utc=True)
+        now = pd.Timestamp.now(tz="UTC")
+        missed = cycles[(~cycles["cycle_id"].isin(submitted)) & (closes < now) & (closes >= now - pd.Timedelta(hours=2))]
+        if not missed.empty:
+            print(f"Cobertura: ciclos cerrados sin entrega: {missed['cycle_id'].tolist()}")
+            events.append({"event_type": "operational_failure", "severity": "critical",
+                           "details": {"missed_cycles": missed["cycle_id"].tolist()},
+                           "decision": "revisar ejecuciones del workflow"})
+
+    if not send or not events:
+        return
+    client.table("monitoring_events").insert(
+        [{"model_version": champion["model_version"], **event} for event in events]
+    ).execute()
+    perf = [e for e in events if e["event_type"] == "performance_drift"]
+    if perf and "model" in champion:
+        evaluate_candidate(client, champion, cutoff, "performance_drift", {"reasons": perf[0]["details"]["reasons"]})
 
 
 def persist_cycle(client: Client, cycle: dict) -> None:
@@ -851,6 +1069,10 @@ def run_forecast(client: Client, send: bool) -> None:
         handle_drift(client, champion, history, cutoff, send=True)
     except Exception as exc:
         print(f"Monitoreo de drift falló ({type(exc).__name__}); la entrega ya quedó registrada.")
+    try:
+        monitor_performance(client, champion, history, cutoff, send=True)
+    except Exception as exc:
+        print(f"Monitoreo de desempeño falló ({type(exc).__name__}); la entrega ya quedó registrada.")
 
 
 def main() -> None:

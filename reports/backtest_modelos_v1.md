@@ -20,7 +20,7 @@ La desviación estándar y el mínimo entre folds ayudan a ver si un modelo depe
 
 | model                       | Accuracy media (%) | Desv. estándar (pp) | Peor fold (%) | Mejor fold (%) | WAPE medio | MAE medio |
 | --------------------------- | ------------------ | ------------------- | ------------- | -------------- | ---------- | --------- |
-| Ensamble Prophet + LightGBM | 87.884             | 0.285               | 87.581        | 88.147         | 0.121      | 42.973    |
+| Ensamble Prophet + LightGBM | 87.411             | 0.267               | 87.152        | 87.684         | 0.126      | 44.656    |
 | Random Forest               | 85.165             | 0.384               | 84.934        | 85.608         | 0.148      | 51.898    |
 | XGBoost                     | 84.987             | 0.391               | 84.597        | 85.379         | 0.15       | 51.979    |
 | Naive estacional semanal    | 83.249             | 0.313               | 83.026        | 83.606         | 0.168      | 59.387    |
@@ -31,7 +31,7 @@ La desviación estándar y el mínimo entre folds ayudan a ver si un modelo depe
 
 | Modelo                      | Fold 1 (%) | Fold 2 (%) | Fold 3 (%) |
 | --------------------------- | ---------- | ---------- | ---------- |
-| Ensamble Prophet + LightGBM | 87.93      | 87.58      | 88.15      |
+| Ensamble Prophet + LightGBM | 87.4       | 87.15      | 87.68      |
 | Naive estacional diario     | 77.8       | 76.83      | 77.89      |
 | Naive estacional semanal    | 83.61      | 83.03      | 83.11      |
 | Persistencia                | 74.26      | 74.47      | 74.57      |
@@ -47,6 +47,6 @@ La desviación estándar y el mínimo entre folds ayudan a ver si un modelo depe
 - **Naive estacional semanal:** repite el valor de la misma estación, hora y día de la semana anterior.
 - **Random Forest:** combina rezagos, medias móviles, calendario, estación y horizonte con muchos árboles entrenados sobre muestras/features aleatorias.
 - **XGBoost:** combina árboles construidos secuencialmente; cada árbol intenta corregir errores de los anteriores.
-- **Ensamble Prophet + LightGBM (champion de producción):** 65% Prophet por estación (perfil diario/semanal promediado de muchas semanas, escalado por la razón demanda real/esperada de las últimas 2 horas) + 35% LightGBM global con rezagos, pendientes, valores de la misma franja ayer y la semana pasada y perfiles promediados de 4 semanas. Es el mismo código (`analysis/ensemble_model.py`) que se entrena y empaqueta en el joblib del pipeline.
+- **Ensamble adaptativo Prophet + LightGBM (champion de producción):** combina Prophet por estación (perfil promediado de muchas semanas, escalado por la razón demanda real/esperada de las últimas 2 horas), LightGBM global (rezagos, pendientes, misma franja ayer y la semana pasada, perfiles de 4 semanas), la misma franja de ayer ajustada al nivel de hoy y persistencia. Los pesos se recalculan en cada origen y estación según el WAPE de cada componente en las 24 h previas (∝ 1/WAPE²). Sin drift cuesta ~0,5 pp frente a pesos fijos 65/35 y con drift gana entre 2 y 11 pp (ver `reports/monitoreo_drift.md`). Es el mismo código (`analysis/ensemble_model.py`) que se entrena y empaqueta en el joblib del pipeline.
 
 Los tres primeros son baselines interpretables. Indican qué tan difícil es la serie y evitan atribuir valor a un modelo complejo que no supere reglas sencillas.
