@@ -4,9 +4,10 @@ Solución MLOps para el reto **Pulso TransMi**: pronosticar la demanda de 12 est
 
 | | |
 |---|---|
-| 🤖 **Modelo en producción** | Ensamble **65% Prophet + 35% LightGBM** con ajuste de nivel de 2 h |
+| 🤖 **Modelo en producción** | Ensamble **adaptativo**: Prophet + LightGBM + referencias recientes, con pesos que se recalculan cada ciclo según el error de las últimas 24 h |
 | 📈 **Validación con datos reales de la competencia** | **85,8%** ensamble · 83,8% Random Forest · 80,7% naive semanal |
-| 🔁 **Automatización** | Envíos cada ciclo · reentrenamiento diario · reentrenamiento por drift |
+| 🔁 **Automatización** | Envíos cada ciclo · reentrenamiento diario · evaluación por drift de datos o de desempeño · promoción solo si supera a lo que producción envió |
+| 📋 **Fase de drift** | [Monitoreo, disparadores y evidencia](reports/monitoreo_drift.md) |
 | 📊 **Tablero** | Vercel + API de solo lectura en Supabase |
 
 > 💡 Los diagramas usan [Mermaid](https://mermaid.js.org/). GitHub los dibuja automáticamente. En **Visual Studio Code**, instala la extensión *Markdown Preview Mermaid Support* y abre la vista previa con `Ctrl+Shift+V`.
@@ -80,16 +81,18 @@ sequenceDiagram
 flowchart TB
     D["Historial de demanda<br/>(hasta el cutoff)"] --> P & L
 
-    subgraph P["Prophet por estación · 65%"]
+    subgraph P["Prophet por estación"]
         P1["Perfil diario + semanal<br/>promediado de muchas semanas"] --> P2["× razón real/esperada<br/>de las últimas 2 h"]
     end
 
-    subgraph L["LightGBM global · 35%"]
+    subgraph L["LightGBM global"]
         L1["Rezagos · pendientes<br/>misma hora ayer / semana pasada<br/>perfiles promediados de 4 semanas"]
     end
 
-    P2 --> E["Ensamble<br/>0,65 · Prophet + 0,35 · LightGBM"]
+    R["Referencias recientes<br/>misma hora ayer × nivel de hoy<br/>persistencia"]
+    P2 --> E["Ensamble adaptativo<br/>pesos ∝ 1 / WAPE² de cada componente<br/>en las últimas 24 h de esa estación"]
     L1 --> E
+    D --> R --> E
     E --> O["Predicción +15 / +30 / +45 / +60 min"]
 ```
 
@@ -97,7 +100,8 @@ flowchart TB
 - **El perfil promediado quita ruido.** Un solo valor de "la semana pasada" es ruidoso; Prophet promedia muchas semanas y obtiene la forma típica del día.
 - **LightGBM reacciona a lo reciente** y los dos se equivocan de forma distinta, así que al combinarlos los errores se compensan.
 - **El ajuste de nivel responde al drift.** Si en las últimas 2 horas llega un 20% más de gente de lo esperado, la parte de Prophet sube un 20%. Con 2 horas se filtra el ruido y el cambio igual se detecta en 2–3 actualizaciones.
-- **Todo va en un solo `.joblib`**: 12 modelos Prophet (en JSON), LightGBM, pesos, variables y métricas de validación.
+- **Pesos adaptativos para la fase de drift.** En cada ciclo y estación se mide cuánto se equivocó cada componente en las últimas 24 h, usando solo targets ya observados, y se le da más peso al que acertó mejor. Si los picos cambian de hora, Prophet pierde peso solo. Sin drift cuesta ~0,5 pp; con drift simulado gana de 2 a 11 pp ([detalles](reports/monitoreo_drift.md)).
+- **Todo va en un solo `.joblib`**: 12 modelos Prophet (en JSON), LightGBM, configuración de pesos, variables y métricas de validación. Cada versión registra el SHA-256 de su joblib.
 
 ---
 
@@ -107,7 +111,8 @@ flowchart TB
 
 | Modelo | Accuracy media | Peor semana | Desv. estándar |
 |---|---:|---:|---:|
-| **Ensamble Prophet + LightGBM** | **87,88%** | 87,58% | 0,28 pp |
+| **Ensamble adaptativo (producción)** | **87,41%** | 87,15% | 0,27 pp |
+| Ensamble fijo 65/35 (versión anterior) | 87,88% | 87,58% | 0,28 pp |
 | Random Forest (modelo anterior) | 85,16% | 84,93% | 0,38 pp |
 | XGBoost | 84,99% | 84,60% | 0,39 pp |
 | Naive semanal | 83,25% | 83,03% | 0,31 pp |
@@ -172,7 +177,10 @@ Después de cada entrega se compara la demanda real con la esperada por estació
 |---|---|---|
 | 0,85 – 1,15 | Normal | Nada |
 | Fuera del rango por poco tiempo | Evento puntual | El ajuste de nivel lo corrige |
-| Fuera del rango **12 h seguidas** (3 ventanas de 4 h) | Drift real | Registra `data_drift` en `monitoring_events` y reentrena si el champion tiene más de 6 h |
+| Fuera del rango **12 h seguidas** (3 ventanas de 4 h) | Drift real | Registra `data_drift` y evalúa un candidato |
+| Últimos 6 ciclos evaluados < 6 anteriores − 3 pp, o < naive semanal | Drift de desempeño | Registra `performance_drift` y evalúa un candidato |
+
+Un candidato solo reemplaza al champion si supera al naive semanal y al Random Forest en el holdout de 7 días **y** a lo que producción realmente envió en las últimas 24 h (entrenado sin esas 24 h). Entre evaluaciones hay al menos 6 h. Todo queda registrado en `training_runs` y `monitoring_events`. Ver [monitoreo y reentrenamiento](reports/monitoreo_drift.md).
 
 Con los datos de arranque, la regla da **~0,6% de falsas alarmas** por estación-hora y detecta **~79%** de los cambios de +20%. En la competencia ya detectó drift real en la estación **05100** (demanda a ~50% de lo normal) y en la **06000** (+20–30%).
 
