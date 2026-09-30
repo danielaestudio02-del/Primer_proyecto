@@ -9,11 +9,17 @@
     :root {
       --bg: #f6f7f9; --card: #ffffff; --text: #1d2330; --muted: #5f6878;
       --border: #e2e5ea; --accent: #c8102e; --accent2: #2463eb; --ok: #1a7f37; --bad: #b42318;
+      --series-model: #2a78d6; --series-naive: #eb6834; --warn: #b25e00;
+      --heat-1: #cde2fb; --heat-2: #86b6ef; --heat-3: #3987e5; --heat-4: #256abf; --heat-5: #0d366b;
+      --heat-ink-light: #0b0b0b; --heat-ink-dark: #ffffff;
     }
     @media (prefers-color-scheme: dark) {
       :root {
         --bg: #12151b; --card: #1b1f27; --text: #e8eaef; --muted: #9aa3b2;
         --border: #2b313c; --accent: #ff4d63; --accent2: #6d9bff; --ok: #4ac26b; --bad: #ff6b5e;
+        --series-model: #3987e5; --series-naive: #d95926; --warn: #f0a238;
+        --heat-1: #1d2b40; --heat-2: #184f95; --heat-3: #2a78d6; --heat-4: #6da7ec; --heat-5: #cde2fb;
+        --heat-ink-light: #ffffff; --heat-ink-dark: #0b0b0b;
       }
     }
     * { box-sizing: border-box; }
@@ -31,7 +37,7 @@
     .kpi .note { color: var(--muted); font-size: .8rem; }
     h2 { font-size: 1.05rem; margin: 0 0 12px; }
     .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
-    select { font: inherit; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border);
+    select { max-width: 100%; font: inherit; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border);
       background: var(--card); color: var(--text); }
     .chart { position: relative; height: 300px; }
     .table-wrap { overflow-x: auto; }
@@ -45,6 +51,25 @@
       border: 1px solid var(--border); }
     .tag.ens { color: var(--accent2); border-color: var(--accent2); }
     .tag.rf { color: var(--muted); }
+    .tag.adapt { color: var(--series-model); border-color: var(--series-model); }
+    .legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: .85rem; color: var(--muted); margin-bottom: 8px; }
+    .legend i { display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
+    .heat { border-collapse: separate; border-spacing: 2px; font-size: .75rem; }
+    .heat th, .heat td { border: 0; padding: 4px 6px; }
+    .heat td.cell { text-align: center; border-radius: 4px; min-width: 38px; font-variant-numeric: tabular-nums; }
+    .heat th.switch { box-shadow: inset 2px 0 0 var(--series-model); }
+    .heat-scale { display: flex; gap: 4px; align-items: center; font-size: .75rem; color: var(--muted); margin-top: 8px; flex-wrap: wrap; }
+    .heat-scale span.sw { width: 26px; height: 12px; border-radius: 3px; display: inline-block; }
+    .events { list-style: none; margin: 0; padding: 0; }
+    .events li { display: grid; grid-template-columns: 26px 1fr; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+    .events .ico { font-size: 1.05rem; line-height: 1.4; }
+    .events .meta { color: var(--muted); font-size: .8rem; }
+    .events .what { font-weight: 600; }
+    .sev-warning .what { color: var(--warn); } .sev-critical .what { color: var(--bad); }
+    .filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+    .filters button { font: inherit; font-size: .8rem; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border);
+      background: var(--card); color: var(--text); cursor: pointer; }
+    .filters button[aria-pressed="true"] { border-color: var(--series-model); color: var(--series-model); font-weight: 600; }
     .hint { color: var(--muted); font-size: .85rem; margin: -6px 0 12px; }
     footer { color: var(--muted); font-size: .8rem; text-align: center; padding-bottom: 24px; }
   </style>
@@ -60,6 +85,38 @@
       <div class="card kpi"><div class="label">WAPE medio por estación</div><div class="value" id="kpi-wape">—</div><div class="note">menor es mejor</div></div>
       <div class="card kpi"><div class="label">Modelo champion</div><div class="value" id="kpi-model" style="font-size:1.05rem">—</div><div class="note" id="kpi-model-note"></div></div>
       <div class="card kpi"><div class="label">Últimos datos</div><div class="value" id="kpi-fresh" style="font-size:1.05rem">—</div><div class="note" id="kpi-fresh-note"></div></div>
+    </section>
+
+    <section class="card">
+      <h2>Evolución por ciclo: modelo vs. naive semanal</h2>
+      <p class="hint">Cada punto es un ciclo evaluado. Si las dos líneas caen juntas, la demanda cambió (drift); si solo cae el modelo, el problema es del modelo. Las líneas verticales marcan cuándo cambió el tipo de modelo en producción.</p>
+      <div class="legend"><span><i style="background:var(--series-model)"></i>Modelo enviado</span><span><i style="background:var(--series-naive)"></i>Naive semanal (mismos targets)</span></div>
+      <div class="chart"><canvas id="chart-evolution"></canvas></div>
+    </section>
+
+    <section class="card">
+      <h2>Accuracy por estación y ciclo</h2>
+      <p class="hint">Últimos 24 ciclos evaluados. Más oscuro = mejor. Sirve para ver si un problema se concentra en una estación o si afecta a todas a la vez. La línea azul a la izquierda de un ciclo marca un cambio de modelo.</p>
+      <div class="table-wrap"><table class="heat" id="heatmap"><tbody><tr><td>Cargando…</td></tr></tbody></table></div>
+      <div class="heat-scale" id="heat-scale"></div>
+    </section>
+
+    <section class="card">
+      <h2>Monitoreo: eventos y decisiones</h2>
+      <p class="hint">Lo que detecta el pipeline después de cada entrega: cambios de nivel por estación (drift de datos), caídas sostenidas de accuracy (drift de desempeño), ciclos sin entrega y decisiones de reentrenamiento.</p>
+      <div class="filters" id="event-filters"></div>
+      <ul class="events" id="events"><li>Cargando…</li></ul>
+    </section>
+
+    <section class="card">
+      <h2>Entrenamientos y decisiones de promoción</h2>
+      <p class="hint">Un candidato solo reemplaza al champion si supera al naive semanal y al Random Forest en el holdout de 7 días, y a lo que producción realmente envió en las últimas 24 h (entrenado sin esas 24 h).</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Fecha (Bogotá)</th><th>Resultado</th><th>Tipo</th><th class="num">Holdout 7 d: candidato</th><th class="num">RF</th><th class="num">Naive</th><th class="num">Últimas 24 h: candidato</th><th class="num">Producción</th></tr></thead>
+          <tbody id="trainings"><tr><td colspan="8">Cargando…</td></tr></tbody>
+        </table>
+      </div>
     </section>
 
     <section class="card">
@@ -80,8 +137,8 @@
       <p class="hint">Cada fila es una entrega. "Naive semanal" es la accuracy que habría tenido repetir la demanda de hace 7 días en esos mismos targets: si los dos bajan, fueron horas difíciles; si solo baja el modelo, el problema es del modelo.</p>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Cutoff (Bogotá)</th><th>Modelo</th><th class="num">Accuracy</th><th class="num">Naive semanal</th><th class="num">Diferencia</th><th class="num">Evaluados</th></tr></thead>
-          <tbody id="cycles"><tr><td colspan="6">Cargando…</td></tr></tbody>
+          <thead><tr><th>Cutoff (Bogotá)</th><th>Modelo</th><th class="num">Accuracy</th><th class="num">vs. ciclo anterior</th><th class="num">Naive semanal</th><th class="num">Modelo − naive</th><th class="num">Evaluados</th></tr></thead>
+          <tbody id="cycles"><tr><td colspan="7">Cargando…</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -201,21 +258,185 @@
       }).join("");
     }
 
+    const KIND_LABEL = { adaptive: "Adaptativo", fixed: "Fijo 65/35", random_forest: "Random Forest" };
+    let versionKinds = null;
+    async function kinds() {
+      if (!versionKinds) {
+        const rows = await api("versions");
+        versionKinds = Object.fromEntries(rows.map((v) => [v.model_version, v.kind]));
+      }
+      return versionKinds;
+    }
+    function kindOf(version, map) {
+      return map[version] || (String(version || "").startsWith("rf-") ? "random_forest" : "fixed");
+    }
+    function modelTag(version, map) {
+      const k = kindOf(version, map);
+      const cls = k === "adaptive" ? "adapt" : k === "fixed" ? "ens" : "rf";
+      return `<span class="tag ${cls}" title="${esc(version)}">${KIND_LABEL[k]}</span>`;
+    }
+    const signed = (v, d = 1) => v == null ? "—" : `<span class="${v >= 0 ? "ok" : "bad"}">${v >= 0 ? "+" : ""}${fmtNum(v, d)}</span>`;
+
     async function loadCycles() {
-      const rows = await api("cycles", { limit: 48 });
+      const [rows, map] = await Promise.all([api("cycles", { limit: 72 }), kinds()]);
       const tbody = document.getElementById("cycles");
-      if (!rows.length) { tbody.innerHTML = `<tr><td colspan="6">Todavía no hay ciclos evaluados.</td></tr>`; return; }
-      tbody.innerHTML = rows.map((c) => {
-        const isEns = String(c.model_version || "").startsWith("ens-");
-        const tag = `<span class="tag ${isEns ? "ens" : "rf"}">${isEns ? "Ensamble" : "Random Forest"}</span>`;
+      if (!rows.length) { tbody.innerHTML = `<tr><td colspan="7">Todavía no hay ciclos evaluados.</td></tr>`; return; }
+      // rows arrive newest first; "vs. ciclo anterior" compares with the next older evaluated cycle.
+      const evaluated = rows.filter((c) => c.accuracy != null);
+      const prevOf = new Map(evaluated.map((c, i) => [c.cycle_id, evaluated[i + 1]]));
+      tbody.innerHTML = rows.slice(0, 48).map((c) => {
         const pending = c.accuracy == null;
-        const diff = pending || c.naive_accuracy == null ? null : c.accuracy - c.naive_accuracy;
-        const diffCell = diff == null ? "—" : `<span class="${diff >= 0 ? "ok" : "bad"}">${diff >= 0 ? "+" : ""}${fmtNum(diff, 1)}</span>`;
-        return `<tr><td>${fmtDate(c.data_cutoff)}</td><td>${tag}</td>
+        const prev = prevOf.get(c.cycle_id);
+        const delta = pending || !prev ? null : c.accuracy - prev.accuracy;
+        const gap = pending || c.naive_accuracy == null ? null : c.accuracy - c.naive_accuracy;
+        return `<tr><td>${fmtDate(c.data_cutoff)}</td><td>${modelTag(c.model_version, map)}</td>
           <td class="num">${pending ? "esperando dato real" : fmtNum(c.accuracy, 1) + "%"}</td>
+          <td class="num">${signed(delta)}</td>
           <td class="num">${c.naive_accuracy == null ? "—" : fmtNum(c.naive_accuracy, 1) + "%"}</td>
-          <td class="num">${diffCell}</td>
+          <td class="num">${signed(gap)}</td>
           <td class="num">${c.evaluated_targets}/${c.targets}</td></tr>`;
+      }).join("");
+      drawEvolution(evaluated.slice().reverse(), map);
+    }
+
+    function drawEvolution(points, map) {
+      const labels = points.map((c) => fmtDate(c.data_cutoff));
+      const switches = [];
+      points.forEach((c, i) => {
+        if (i > 0 && kindOf(c.model_version, map) !== kindOf(points[i - 1].model_version, map)) {
+          switches.push({ index: i, label: "→ " + KIND_LABEL[kindOf(c.model_version, map)] });
+        }
+      });
+      const markers = {
+        id: "modelSwitch",
+        afterDatasetsDraw(chart) {
+          const { ctx, chartArea, scales } = chart;
+          ctx.save();
+          ctx.strokeStyle = css("--muted"); ctx.fillStyle = css("--text");
+          ctx.setLineDash([4, 4]); ctx.lineWidth = 1; ctx.font = "12px system-ui, sans-serif";
+          for (const s of switches) {
+            const x = (scales.x.getPixelForValue(s.index - 1) + scales.x.getPixelForValue(s.index)) / 2;
+            ctx.beginPath(); ctx.moveTo(x, chartArea.top); ctx.lineTo(x, chartArea.bottom); ctx.stroke();
+            ctx.fillText(s.label, Math.min(x + 4, chartArea.right - 90), chartArea.top + 12);
+          }
+          ctx.restore();
+        },
+      };
+      new Chart(document.getElementById("chart-evolution"), {
+        type: "line",
+        data: {
+          labels,
+          datasets: [
+            { label: "Modelo enviado", data: points.map((c) => c.accuracy), borderColor: css("--series-model"),
+              backgroundColor: css("--series-model"), borderWidth: 2, pointRadius: 3, pointHoverRadius: 6, tension: 0.2 },
+            { label: "Naive semanal", data: points.map((c) => c.naive_accuracy), borderColor: css("--series-naive"),
+              backgroundColor: css("--series-naive"), borderWidth: 2, pointRadius: 0, pointHoverRadius: 5, borderDash: [5, 4], tension: 0.2 },
+          ],
+        },
+        options: {
+          maintainAspectRatio: false,
+          interaction: { mode: "index", intersect: false },
+          plugins: {
+            legend: { display: false },
+            tooltip: { callbacks: {
+              label: (item) => `${item.dataset.label}: ${fmtNum(item.parsed.y, 1)}%`,
+              afterBody: (items) => `Modelo: ${KIND_LABEL[kindOf(points[items[0].dataIndex].model_version, map)]}`,
+            } },
+          },
+          scales: { x: { ticks: { maxTicksLimit: 8 }, grid: { display: false } },
+                    y: { suggestedMin: 40, max: 100, title: { display: true, text: "Accuracy (%)" } } },
+        },
+        plugins: [markers],
+      });
+    }
+
+    const HEAT_BINS = [[0, 70, "--heat-1", "--heat-ink-light"], [70, 80, "--heat-2", "--heat-ink-light"],
+      [80, 85, "--heat-3", "--heat-ink-dark"], [85, 90, "--heat-4", "--heat-ink-dark"], [90, 101, "--heat-5", "--heat-ink-dark"]];
+    async function loadHeatmap() {
+      const [rows, map] = await Promise.all([api("stationcycles", { cycles: 24 }), kinds()]);
+      const table = document.getElementById("heatmap");
+      if (!rows.length) { table.innerHTML = `<tbody><tr><td>Todavía no hay ciclos evaluados.</td></tr></tbody>`; return; }
+      const cycles = [...new Map(rows.map((r) => [r.cycle_id, r])).values()];
+      const stations = [...new Set(rows.map((r) => r.station_id))].sort();
+      const cell = new Map(rows.map((r) => [r.cycle_id + "|" + r.station_id, r]));
+      const hour = (v) => new Date(v).toLocaleTimeString("es-CO", { timeZone: "America/Bogota", hour: "2-digit", minute: "2-digit" });
+      const head = cycles.map((c, i) => {
+        const sw = i > 0 && kindOf(c.model_version, map) !== kindOf(cycles[i - 1].model_version, map);
+        return `<th class="${sw ? "switch" : ""}" title="${fmtDate(c.data_cutoff)} · ${KIND_LABEL[kindOf(c.model_version, map)]}">${hour(c.data_cutoff)}</th>`;
+      }).join("");
+      const body = stations.map((st) => `<tr><th>${esc(st)}</th>` + cycles.map((c) => {
+        const r = cell.get(c.cycle_id + "|" + st);
+        if (!r) return `<td class="cell">—</td>`;
+        const [, , bg, ink] = HEAT_BINS.find(([lo, hi]) => r.accuracy >= lo && r.accuracy < hi);
+        const naive = r.naive_accuracy == null ? "—" : fmtNum(r.naive_accuracy, 1) + "%";
+        return `<td class="cell" style="background:var(${bg});color:var(${ink})" title="Estación ${esc(st)} · ${fmtDate(c.data_cutoff)}\nModelo: ${fmtNum(r.accuracy, 1)}% · Naive semanal: ${naive}">${Math.round(r.accuracy)}</td>`;
+      }).join("") + "</tr>").join("");
+      table.innerHTML = `<thead><tr><th>Estación</th>${head}</tr></thead><tbody>${body}</tbody>`;
+      const wrap = table.parentElement; wrap.scrollLeft = wrap.scrollWidth;  // start at the newest cycles
+      document.getElementById("heat-scale").innerHTML = "Accuracy: " + HEAT_BINS.map(([lo, hi, bg]) =>
+        `<span class="sw" style="background:var(${bg})"></span>${hi > 100 ? "≥" + lo : lo + "–" + hi}%`).join(" ");
+    }
+
+    const EVENT_INFO = {
+      data_drift: { ico: "⚠️", label: "Drift de datos" },
+      performance_drift: { ico: "📉", label: "Drift de desempeño" },
+      operational_failure: { ico: "⛔", label: "Falla operativa" },
+      retraining_decision: { ico: "🔁", label: "Decisión de reentrenamiento" },
+    };
+    let allEvents = [];
+    function describe(e) {
+      const d = e.details || {};
+      if (e.event_type === "data_drift") {
+        const arrow = d.direction === "up" ? "↑ más demanda" : "↓ menos demanda";
+        const ratios = (d.level_ratios_newest_first || []).map((r) => fmtNum(r, 2)).join(" · ");
+        return `Estación <b>${esc(e.station_id)}</b>: ${arrow} de lo esperado durante ${d.window_hours || 12} h (razón real/esperada ${ratios})`;
+      }
+      if (e.event_type === "performance_drift") {
+        return `Últimos 6 ciclos ${fmtNum(d.last_mean_accuracy, 1)}% (antes ${fmtNum(d.previous_mean_accuracy, 1)}%, naive ${fmtNum(d.last_mean_naive_accuracy, 1)}%) — ${(d.reasons || []).map(esc).join("; ")}`;
+      }
+      if (e.event_type === "operational_failure") return `Ciclos sin entrega: ${(d.missed_cycles || []).map(esc).join(", ")}`;
+      const trig = d.trigger ? ` (disparador: ${esc(EVENT_INFO[d.trigger]?.label || d.trigger)})` : "";
+      return `${esc(e.decision)}${trig}`;
+    }
+    function renderEvents(filter) {
+      const list = document.getElementById("events");
+      const rows = allEvents.filter((e) => filter === "all" || e.event_type === filter);
+      if (!rows.length) { list.innerHTML = `<li>Sin eventos registrados.</li>`; return; }
+      list.innerHTML = rows.map((e) => {
+        const info = EVENT_INFO[e.event_type] || { ico: "•", label: e.event_type };
+        return `<li class="sev-${esc(e.severity)}"><span class="ico" aria-hidden="true">${info.ico}</span>
+          <div><div class="what">${info.label}</div><div>${describe(e)}</div>
+          <div class="meta">${fmtDate(e.detected_at)} · champion ${esc(e.model_version || "—")}</div></div></li>`;
+      }).join("");
+    }
+    async function loadEvents() {
+      allEvents = await api("events", { limit: 150 });
+      const counts = allEvents.reduce((acc, e) => (acc[e.event_type] = (acc[e.event_type] || 0) + 1, acc), {});
+      const options = [["all", `Todos (${allEvents.length})`], ...Object.keys(EVENT_INFO).filter((k) => counts[k]).map((k) => [k, `${EVENT_INFO[k].label} (${counts[k]})`])];
+      const bar = document.getElementById("event-filters");
+      bar.innerHTML = options.map(([k, label], i) => `<button type="button" data-k="${k}" aria-pressed="${i === 0}">${label}</button>`).join("");
+      bar.onclick = (ev) => {
+        const b = ev.target.closest("button"); if (!b) return;
+        bar.querySelectorAll("button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+        renderEvents(b.dataset.k);
+      };
+      renderEvents("all");
+    }
+
+    async function loadTrainings() {
+      const rows = await api("trainings", { limit: 30 });
+      const tbody = document.getElementById("trainings");
+      if (!rows.length) { tbody.innerHTML = `<tr><td colspan="8">Sin entrenamientos registrados.</td></tr>`; return; }
+      const pct = (v) => v == null ? "—" : fmtNum(v, 2) + "%";
+      tbody.innerHTML = rows.map((t) => {
+        const result = t.promoted ? `<span class="ok">✓ Promovido</span>` : `<span class="bad">✗ No promovido</span>`;
+        const kind = t.adaptive ? "Adaptativo" : "Fijo / RF";
+        const recent = t.recent_candidate == null
+          ? `<td class="num" colspan="2" title="${esc(t.recent_skipped || "")}">${t.recent_skipped ? "sin ventana reciente" : "—"}</td>`
+          : `<td class="num">${pct(t.recent_candidate)}</td><td class="num">${pct(t.recent_production)}</td>`;
+        return `<tr title="${esc(t.notes || "")}"><td>${fmtDate(t.finished_at)}</td><td>${result}</td><td>${kind}</td>
+          <td class="num">${pct(t.holdout_ensemble)}</td><td class="num">${pct(t.holdout_random_forest)}</td>
+          <td class="num">${pct(t.holdout_weekly_naive)}</td>${recent}</tr>`;
       }).join("");
     }
 
@@ -229,6 +450,9 @@
     loadStations().catch(fail);
     loadSubmissions().catch(fail);
     loadCycles().catch(fail);
+    loadHeatmap().catch(fail);
+    loadEvents().catch(fail);
+    loadTrainings().catch(fail);
   </script>
 </body>
 </html>
