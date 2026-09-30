@@ -28,6 +28,10 @@ Las tablas siguen cerradas para los roles del navegador. La migración `supabase
 | `status` | `api_pipeline_status()` | — |
 | `demand` | `api_station_demand(p_station_id, p_hours)` | `station_id`, `hours` (1–336, def. 48) |
 | `cycles` | `api_cycle_accuracy(p_limit)` | `limit` (1–200, def. 48) |
+| `events` | `api_monitoring_events(p_limit)` | `limit` (1–500, def. 100) |
+| `versions` | `api_model_versions()` | — |
+| `trainings` | `api_training_history(p_limit)` | `limit` (1–200, def. 30) |
+| `stationcycles` | `api_station_cycle_accuracy(p_cycles)` | `cycles` (1–96, def. 24) |
 | `predictions` | `api_predictions_vs_actuals(p_station_id, p_from, p_to)` | `station_id`, `from`, `to` (ISO 8601, máx. 14 días) |
 
 `accuracy` usa la última entrega oficial (`accepted`/`duplicate`) de cada ciclo, cruza sus predicciones con `observations` y calcula la métrica del curso: WAPE por estación, accuracy = máx(0, 100·(1 − WAPE)) y accuracy oficial = promedio de las estaciones. Además la desglosa por estación y por horizonte.
@@ -48,6 +52,7 @@ curl -X POST "$SUPABASE_URL/rest/v1/rpc/api_accuracy_summary" \
    - `supabase/migrations/202609250001_results_api.sql`
    - `supabase/migrations/202609260001_results_api_virtual_clock.sql`: ancla las ventanas de resultados a la observación más reciente y no a la fecha real, porque la competencia usa un reloj virtual.
    - `supabase/migrations/202609300001_cycle_accuracy.sql`: accuracy por ciclo junto a la del naive semanal en los mismos targets (tabla "Accuracy por ciclo" del tablero).
+   - `supabase/migrations/202609300002_monitoring_api.sql`: eventos de monitoreo, historial de entrenamientos, tipo de modelo por versión y accuracy por estación y ciclo (secciones de monitoreo del tablero).
 2. Comprueba que el navegador sigue sin poder leer las tablas, pero sí puede usar la API:
 
    ```sql

@@ -125,6 +125,16 @@ También se verificó que un candidato que pierde contra lo que envió producci�
 
 ---
 
+## Dónde verlo en el tablero (Vercel)
+
+| Sección | Qué muestra | Pregunta que responde |
+|---|---|---|
+| Evolución por ciclo | Accuracy del modelo y del naive semanal por ciclo, con líneas en cada cambio de tipo de modelo | ¿Cayó la demanda para todos (drift) o solo el modelo? ¿Qué pasó antes y después de un cambio de versión? |
+| Accuracy por estación y ciclo | Mapa de calor de los últimos 24 ciclos evaluados | ¿El problema se concentra en una estación o es general? |
+| Accuracy por ciclo | Tabla con la versión (adaptativo, fijo o RF), el cambio frente al ciclo anterior y la diferencia con el naive | ¿Es una tendencia o un único resultado malo? |
+| Monitoreo: eventos y decisiones | Drift de datos por estación, drift de desempeño, ciclos sin entrega y decisiones de reentrenamiento, filtrables | ¿Qué detectó el sistema y qué decidió? |
+| Entrenamientos y decisiones de promoción | Cada candidato con su holdout de 7 días y la comparación contra producción en las últimas 24 h | ¿Por qué se promovió o se conservó una versión? |
+
 ## Consultas de evidencia (SQL Editor de Supabase)
 
 **Accuracy por ciclo frente al naive semanal**
