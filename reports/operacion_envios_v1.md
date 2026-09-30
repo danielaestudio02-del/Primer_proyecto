@@ -10,6 +10,7 @@
 - Los champions Random Forest anteriores (artefactos con `pipeline`) siguen funcionando para pronosticar hasta que el primer entrenamiento del ensamble los reemplace.
 - El cursor de stream se confirma en Supabase después de guardar cada página. Repetir una página es seguro por el upsert `(station_id, observed_at)`.
 - Una entrega conserva su recibo, targets, predicciones, versión de modelo y hash del batch.
+- **Reintentos ante fallas de red:** si la API del curso o Supabase no responden (timeout, conexión cortada o HTTP 5xx), el pipeline termina con código 75 y `scripts/retry_transient.sh` lo vuelve a ejecutar hasta 3 veces, con 30 s de espera. Cualquier otro error falla de inmediato y no se reintenta. Repetir es seguro: las observaciones se guardan con upsert y cada entrega usa un `Idempotency-Key` fijo por ciclo y modelo.
 
 ## Preparación única en Supabase y GitHub
 

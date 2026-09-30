@@ -7,6 +7,7 @@ const ENDPOINTS = {
   champion: { fn: "api_champion_model", params: [] },
   models: { fn: "api_model_history", params: ["p_limit"] },
   submissions: { fn: "api_submissions", params: ["p_limit"] },
+  cycles: { fn: "api_cycle_accuracy", params: ["p_limit"] },
   accuracy: { fn: "api_accuracy_summary", params: ["p_days"] },
   status: { fn: "api_pipeline_status", params: [] },
   demand: { fn: "api_station_demand", params: ["p_station_id", "p_hours"] },

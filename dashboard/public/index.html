@@ -40,6 +40,12 @@
     th { color: var(--muted); font-weight: 600; }
     .ok { color: var(--ok); } .bad { color: var(--bad); }
     .error { color: var(--bad); }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: .75rem; font-weight: 600;
+      border: 1px solid var(--border); }
+    .tag.ens { color: var(--accent2); border-color: var(--accent2); }
+    .tag.rf { color: var(--muted); }
+    .hint { color: var(--muted); font-size: .85rem; margin: -6px 0 12px; }
     footer { color: var(--muted); font-size: .8rem; text-align: center; padding-bottom: 24px; }
   </style>
 </head>
@@ -67,6 +73,17 @@
         <select id="station-select" aria-label="Estación"></select>
       </div>
       <div class="chart"><canvas id="chart-pred"></canvas></div>
+    </section>
+
+    <section class="card">
+      <h2>Accuracy por ciclo</h2>
+      <p class="hint">Cada fila es una entrega. "Naive semanal" es la accuracy que habría tenido repetir la demanda de hace 7 días en esos mismos targets: si los dos bajan, fueron horas difíciles; si solo baja el modelo, el problema es del modelo.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Cutoff (Bogotá)</th><th>Modelo</th><th class="num">Accuracy</th><th class="num">Naive semanal</th><th class="num">Diferencia</th><th class="num">Evaluados</th></tr></thead>
+          <tbody id="cycles"><tr><td colspan="6">Cargando…</td></tr></tbody>
+        </table>
+      </div>
     </section>
 
     <section class="card">
@@ -184,6 +201,24 @@
       }).join("");
     }
 
+    async function loadCycles() {
+      const rows = await api("cycles", { limit: 48 });
+      const tbody = document.getElementById("cycles");
+      if (!rows.length) { tbody.innerHTML = `<tr><td colspan="6">Todavía no hay ciclos evaluados.</td></tr>`; return; }
+      tbody.innerHTML = rows.map((c) => {
+        const isEns = String(c.model_version || "").startsWith("ens-");
+        const tag = `<span class="tag ${isEns ? "ens" : "rf"}">${isEns ? "Ensamble" : "Random Forest"}</span>`;
+        const pending = c.accuracy == null;
+        const diff = pending || c.naive_accuracy == null ? null : c.accuracy - c.naive_accuracy;
+        const diffCell = diff == null ? "—" : `<span class="${diff >= 0 ? "ok" : "bad"}">${diff >= 0 ? "+" : ""}${fmtNum(diff, 1)}</span>`;
+        return `<tr><td>${fmtDate(c.data_cutoff)}</td><td>${tag}</td>
+          <td class="num">${pending ? "esperando dato real" : fmtNum(c.accuracy, 1) + "%"}</td>
+          <td class="num">${c.naive_accuracy == null ? "—" : fmtNum(c.naive_accuracy, 1) + "%"}</td>
+          <td class="num">${diffCell}</td>
+          <td class="num">${c.evaluated_targets}/${c.targets}</td></tr>`;
+      }).join("");
+    }
+
     function fail(err) {
       const el = document.getElementById("subtitle");
       el.textContent = `Error al cargar datos: ${err.message}`;
@@ -193,6 +228,7 @@
     loadSummary().catch(fail);
     loadStations().catch(fail);
     loadSubmissions().catch(fail);
+    loadCycles().catch(fail);
   </script>
 </body>
 </html>
