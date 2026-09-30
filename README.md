@@ -209,7 +209,7 @@ Primer_proyecto/
 ## 🚀 Cómo operar
 
 ### Automático (no requiere nada)
-- **Cada 10 minutos:** sincroniza, envía si hay ciclo abierto y revisa drift.
+- **Cada 10 minutos:** sincroniza, envía si hay ciclo abierto y revisa drift. Si la API o Supabase fallan por un problema de red momentáneo, reintenta solo hasta 3 veces dentro de la misma ejecución.
 - **Cada día a las 00:07 (Bogotá):** reentrena y promueve el champion solo si le gana al naive semanal y al Random Forest.
 
 ### Manual

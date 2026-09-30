@@ -17,6 +17,7 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
+import httpx
 import requests
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestRegressor
@@ -50,6 +51,12 @@ DRIFT_BAND = (0.85, 1.15)
 DRIFT_WINDOW_STEPS = 16
 DRIFT_WINDOWS = 3
 DRIFT_RETRAIN_MIN_AGE = pd.Timedelta(hours=6)
+# Exit code for transient network failures; the workflows retry only this code.
+EXIT_TRANSIENT = 75
+
+
+class TransientError(RuntimeError):
+    """Network failure or 5xx from the course API; safe to retry the whole run."""
 
 
 def load_local_env() -> None:
@@ -87,7 +94,7 @@ def api_get(path: str, params: dict[str, Any] | None = None) -> requests.Respons
         )
         return response
     except requests.RequestException as exc:
-        raise RuntimeError(f"Pulso API no disponible ({type(exc).__name__}).") from None
+        raise TransientError(f"Pulso API no disponible ({type(exc).__name__}).") from None
 
 
 def paged_rows(client: Client, table: str, selection: str) -> list[dict]:
@@ -149,6 +156,8 @@ def sync_stream(client: Client) -> int:
             if cursor:
                 params["cursor"] = cursor
             response = api_get("/v1/stream/observations", params)
+            if response.status_code >= 500:
+                raise TransientError(f"Stream API respondió HTTP {response.status_code}.")
             if response.status_code >= 400:
                 raise RuntimeError(f"Stream API respondió HTTP {response.status_code}.")
             try:
@@ -671,6 +680,8 @@ def run_forecast(client: Client, send: bool) -> None:
         if code in {"no_open_cycle", "no_open_forecast_cycle"}:
             print("No hay ciclo abierto; sincronización completada sin envío.")
             return
+    if response.status_code >= 500:
+        raise TransientError(f"Consulta del ciclo respondió HTTP {response.status_code}.")
     if response.status_code >= 400:
         raise RuntimeError(f"Consulta del ciclo respondió HTTP {response.status_code}.")
     cycle = response.json()
@@ -771,7 +782,10 @@ def run_forecast(client: Client, send: bool) -> None:
             timeout=30,
         )
     except requests.RequestException as exc:
-        raise RuntimeError(f"Envío a Pulso API falló ({type(exc).__name__}).") from None
+        # Safe to retry: the Idempotency-Key makes a repeated submission a no-op.
+        raise TransientError(f"Envío a Pulso API falló ({type(exc).__name__}).") from None
+    if submission.status_code >= 500:
+        raise TransientError(f"Pulso API no pudo procesar la entrega (HTTP {submission.status_code}).")
     if submission.status_code >= 400:
         try:
             error = submission.json()
@@ -876,5 +890,7 @@ if __name__ == "__main__":
         main()
     except Exception as exc:
         message = str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__
-        print(f"Pipeline detenido: {message}", file=sys.stderr)
-        raise SystemExit(1) from None
+        # Supabase calls go through httpx; a dropped connection or timeout there is transient too.
+        transient = isinstance(exc, (TransientError, httpx.TransportError, requests.RequestException))
+        print(f"Pipeline detenido: {message}" + (" (error de red transitorio)" if transient else ""), file=sys.stderr)
+        raise SystemExit(EXIT_TRANSIENT if transient else 1) from None
