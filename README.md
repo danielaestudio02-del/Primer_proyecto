@@ -89,7 +89,7 @@ flowchart TB
         L1["Rezagos · pendientes<br/>misma hora ayer / semana pasada<br/>perfiles promediados de 4 semanas"]
     end
 
-    R["Referencias recientes<br/>misma hora ayer × nivel de hoy<br/>persistencia"]
+    R["Referencias recientes<br/>misma hora ayer × nivel de hoy<br/>Prophet × nivel de la misma franja ayer<br/>persistencia"]
     P2 --> E["Ensamble adaptativo<br/>pesos ∝ 1 / WAPE² de cada componente<br/>en las últimas 24 h de esa estación"]
     L1 --> E
     D --> R --> E
@@ -101,6 +101,7 @@ flowchart TB
 - **LightGBM reacciona a lo reciente** y los dos se equivocan de forma distinta, así que al combinarlos los errores se compensan.
 - **El ajuste de nivel responde al drift.** Si en las últimas 2 horas llega un 20% más de gente de lo esperado, la parte de Prophet sube un 20%. Con 2 horas se filtra el ruido y el cambio igual se detecta en 2–3 actualizaciones.
 - **Pesos adaptativos para la fase de drift.** En cada ciclo y estación se mide cuánto se equivocó cada componente en las últimas 24 h, usando solo targets ya observados, y se le da más peso al que acertó mejor. Si los picos cambian de hora, Prophet pierde peso solo. Sin drift cuesta ~0,5 pp; con drift simulado gana de 2 a 11 pp ([detalles](reports/monitoreo_drift.md)).
+- **Picos que cambian de altura.** Un quinto componente corrige la curva de Prophet con el nivel observado en la misma franja de ayer. Así, si un pico creció o se aplanó (como en Portal Américas y Banderas), se corrige desde su primer intervalo y no dos horas después. Suma de +0,1 a +1,1 pp según el escenario.
 - **Todo va en un solo `.joblib`**: 12 modelos Prophet (en JSON), LightGBM, configuración de pesos, variables y métricas de validación. Cada versión registra el SHA-256 de su joblib.
 
 ---

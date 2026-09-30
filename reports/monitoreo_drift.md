@@ -89,6 +89,8 @@ Cambiar el nombre no demuestra reentrenamiento: cada versión nueva tiene su pro
 | 27/09 02:51 | Reentrenamiento automático por drift: **85,61%** frente a 83,43% (RF) y 80,21% (naive) → promovido | `retraining_decision`, `training_runs` |
 | Fase de drift (≥ 29/09) | El naive semanal cae a **57–62%**: la semana anterior dejó de parecerse a la actual. El ensamble fijo le gana por **15–29 pp**, pero se queda en **75–88%** por ciclo | Tabla "Accuracy por ciclo" |
 | 30/09 | Diagnóstico: el ensamble fijo depende de la historia de semanas previas. Se agregan **pesos adaptativos** y la comparación contra lo que realmente envió producción | Este documento; simulaciones abajo |
+| 30/09 (tarde) | Adaptativo promovido (87,06% frente a 78,52% de producción en las últimas 24 h). En sus primeros ciclos: **89–91,5%** frente a 77–86% del fijo | Tabla "Accuracy por ciclo" |
+| 30/09 (noche) | En **05000 Portal Américas** los picos crecieron y en **05100 Banderas** se aplanaron, mientras el valle casi no cambió. El ajuste de nivel de las últimas 2 h corrige tarde el inicio de cada pico. Se agrega el componente **Prophet × nivel de la misma franja ayer** | "Predicción vs. demanda"; experimento abajo |
 
 ### Simulación de los tipos de drift de la guía
 
@@ -111,6 +113,30 @@ Peso medio que recibe cada componente según el escenario:
 | Mixto | **0,13** | 0,38 | 0,30 | 0,19 |
 
 Cuando cambia la forma del día, Prophet pierde peso automáticamente, porque su perfil histórico deja de servir, y lo ganan las referencias recientes.
+
+### Drift en la altura de los picos: componente "misma franja ayer"
+
+En el tablero se vio que en Banderas y Portal Américas el modelo acierta en el valle y falla en los picos: en una estación se pasa y en la otra se queda corto. La razón de nivel usa las últimas 2 h, y al arrancar el pico esas 2 h fueron valle. Además, en Banderas el valle subió un poco, así que la razón llegaba al tope de 2× y duplicaba el pico: son los puntos en ~660 frente a ~250 reales.
+
+El nuevo componente `prophet_slot` escala la curva de Prophet con la razón real/esperada **alrededor de la misma franja de ayer** (ventana de 2 h centrada en ella, que ya estaba observada en el origen). Si ayer el pico de la mañana fue la mitad de lo esperado, hoy el pico se corrige desde su primer intervalo. Entra como quinto componente del ensamble adaptativo, con peso ∝ 1/WAPE² igual que los demás.
+
+Mismo protocolo que la tabla anterior (reentrenamiento diario, 3 días de evaluación). Accuracy oficial:
+
+| Escenario | Naive semanal | Adaptativo (4 componentes) | **+ misma franja ayer** | Diferencia |
+|---|---:|---:|---:|---:|
+| Sin drift | 83,0% | 87,74% | **87,84%** | +0,10 |
+| Cambio de nivel por estación | 62,3% | 85,75% | **86,27%** | +0,52 |
+| Los picos cambian de altura (valle igual) | 64,8% | 85,81% | **86,20%** | +0,39 |
+| Picos y valle en direcciones opuestas (tipo Banderas) | 66,3% | 85,62% | **86,04%** | +0,42 |
+| Mixto (nivel + forma + relación) | 52,4% | 82,41% | **83,51%** | +1,10 |
+
+Gana en los cinco escenarios, también sin drift, y más en horas pico (p. ej. mixto: 82,5% → 83,7%). También se probó y **se descartó**:
+
+- **Pesos calculados sobre las mismas horas de ayer** en lugar de las últimas 24 h: ±0,1 pp, sin mejora.
+- **Suavizar la razón de nivel cuando hay poco volumen** (sumar una constante al numerador y al denominador): no mejora y empeora en el escenario tipo Banderas (85,62% → 85,2–85,5%).
+- **Ampliar el tope de la razón de 2× a 3×**: +0,01 a +0,26 pp. Es una ganancia marginal y aumenta el riesgo de sobrerreacción, así que se mantiene en 2×.
+
+Los modelos guardados antes de este cambio siguen prediciendo con sus cuatro componentes (`adaptive_components` va dentro del joblib). El nuevo componente solo llega a producción cuando un candidato entrenado con él le gana al champion en las predicciones que realmente envió en las últimas 24 h.
 
 También se probó entrenar solo con datos recientes (Prophet con 14 días, LightGBM con vida media de 3 días): empeoró en el escenario de nivel (80,4% frente a 83,7%) y se descartó.
 
