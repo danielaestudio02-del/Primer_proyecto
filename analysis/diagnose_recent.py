@@ -73,7 +73,20 @@ def main() -> None:
         sub = sub[["station_id", "origin", "target_at", "predicted_value"]].rename(columns={"predicted_value": "enviado"})
         rows = rows.merge(sub, on=["station_id", "origin", "target_at"], how="left")
 
-    base = ["persist", "mean_1h", "mean_2h", "trend", "daily", "daily_x_1h_noclip", "weekly",
+    # Predictores ajustados solo con las últimas horas (reajustados en cada origen).
+    from recent_models import predict_recent, wide_matrix
+    wide = wide_matrix(history)
+    for window in (12, 24, 48):
+        vals = {k: np.full(len(rows), np.nan) for k in ("own_ar", "cross_ar", "pooled_ar")}
+        for origin, idx in rows.groupby("origin").groups.items():
+            pr = predict_recent(wide, origin, window_h=window)
+            sub = rows.loc[idx]
+            for k in vals:
+                vals[k][rows.index.get_indexer(idx)] = [pr[k].get((st, h), np.nan) for st, h in zip(sub["station_id"], sub["horizon"])]
+        for k, v in vals.items():
+            rows[f"{k}_{window}h"] = v
+
+    base = [c for c in rows if c.endswith(("ar_12h", "ar_24h", "ar_48h"))] + ["persist", "mean_1h", "mean_2h", "trend", "daily", "daily_x_1h_noclip", "weekly",
             "weekly_x_1h_noclip", "daily_lvl", "prophet", "lightgbm", "prediction"]
     base = [c for c in base if c in rows]
 
