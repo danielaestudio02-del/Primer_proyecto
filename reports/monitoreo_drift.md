@@ -136,6 +136,21 @@ Gana en los cinco escenarios, también sin drift, y más en horas pico (p. ej. m
 - **Suavizar la razón de nivel cuando hay poco volumen** (sumar una constante al numerador y al denominador): no mejora y empeora en el escenario tipo Banderas (85,62% → 85,2–85,5%).
 - **Ampliar el tope de la razón de 2× a 3×**: +0,01 a +0,26 pp. Es una ganancia marginal y aumenta el riesgo de sobrerreacción, así que se mantiene en 2×.
 
+### Pesos que siguen más rápido cada fase
+
+En la madrugada virtual del 18/09 el profesor inició la fase de drift. Aparecieron picos de ~1.000–1.200 pasajeros en plena madrugada (p. ej. 02300). La accuracy por ciclo cayó a 43–49% y el naive semanal a 25–39%. **Toda la clase** quedó entre 47% y 61% en los últimos 6 ciclos. Como las fases duran unas 6 h y los pesos adaptativos promediaban por igual los errores de 24 h, el ensamble tardaba en pasarle el peso a lo reciente.
+
+Cambio: cada error de la ventana se pondera por exp(−(edad_h − 1)/3), así que la influencia de una hora cae a la mitad cada ~2 h (`adaptive_decay_h = 3`).
+
+| Escenario | Adaptativo actual | + misma franja ayer | **+ errores recientes (τ = 3 h)** | Ventana de 6 h | Ventana de 12 h |
+|---|---:|---:|---:|---:|---:|
+| Sin drift | 87,74% | 87,84% | **87,81%** | 87,80% | 87,82% |
+| Cambio de nivel | 85,75% | 86,27% | **86,49%** | 86,41% | 86,41% |
+| Mixto | 82,41% | 83,51% | **84,16%** | 83,98% | 83,81% |
+| Picos nuevos de madrugada, transición de 2 h | 85,34% | 85,52% | **85,55%** | 85,44% | 85,47% |
+
+En el escenario de picos nuevos de madrugada, todas las variantes se quedan en ~71% en esas horas, igual que la persistencia. **Ningún modelo puede anticipar el primer ciclo de un cambio abrupto**, así que lo que se puede mejorar es la velocidad de recuperación. Ponderar por recencia es la variante más estable: en la simulación mixta gana de 0,3 a 1,1 pp por día y no empeora sin drift.
+
 Los modelos guardados antes de este cambio siguen prediciendo con sus cuatro componentes (`adaptive_components` va dentro del joblib). El nuevo componente solo llega a producción cuando un candidato entrenado con él le gana al champion en las predicciones que realmente envió en las últimas 24 h.
 
 También se probó entrenar solo con datos recientes (Prophet con 14 días, LightGBM con vida media de 3 días): empeoró en el escenario de nivel (80,4% frente a 83,7%) y se descartó.
