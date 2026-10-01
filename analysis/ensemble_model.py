@@ -167,7 +167,8 @@ class PulsoEnsemble:
     for every station and origin, each component (Prophet, LightGBM, same slot
     yesterday scaled to today's level, persistence and Prophet scaled by the level
     observed around the same slot yesterday) is scored on the previous
-    `adaptive_lookback_h` hours using only targets already observed at the origin,
+    `adaptive_lookback_h` hours using only targets already observed at the origin
+    (errors weighted by exp(-age / adaptive_decay_h), so the last hours count most),
     and the components are blended with weights proportional to 1 / WAPE^2.
     """
 
@@ -180,11 +181,13 @@ class PulsoEnsemble:
         adaptive: bool = True,
         adaptive_lookback_h: int = 24,
         adaptive_min_points: int = 16,
+        adaptive_decay_h: float | None = 3.0,
     ) -> None:
         self.adaptive = adaptive
         self.adaptive_lookback_h = adaptive_lookback_h
         self.adaptive_min_points = adaptive_min_points
         self.adaptive_components = ADAPTIVE_COMPONENTS
+        self.adaptive_decay_h = adaptive_decay_h
         self.prophet_weight = prophet_weight
         self.level_window = level_window
         self.level_clip = level_clip
@@ -211,6 +214,7 @@ class PulsoEnsemble:
             "adaptive": getattr(self, "adaptive", False),
             "adaptive_lookback_h": getattr(self, "adaptive_lookback_h", None),
             "adaptive_components": list(self._components()),
+            "adaptive_decay_h": getattr(self, "adaptive_decay_h", None),
         }
 
     # ----- training -------------------------------------------------------
@@ -360,7 +364,16 @@ class PulsoEnsemble:
         for k in components:
             shadow[f"e_{k}"] = (shadow["y"] - comp[k].to_numpy()).abs()
         joined = pairs.merge(shadow.rename(columns={"origin": "shadow_origin"}), on=["station_id", "shadow_origin"])
-        joined = joined[joined["target_at"] <= joined["origin"]]
+        joined = joined[joined["target_at"] <= joined["origin"]].copy()
+        decay = getattr(self, "adaptive_decay_h", None)
+        if decay:
+            # Recent errors count more: a drift phase lasts a few hours, so the blend must
+            # follow it before the 24 h window fills with the new regime.
+            age_h = (joined["origin"] - joined["shadow_origin"]) / pd.Timedelta(hours=1)
+            recency = np.exp(-(age_h - 1) / decay)
+            joined["y"] = joined["y"] * recency
+            for k in components:
+                joined[f"e_{k}"] = joined[f"e_{k}"] * recency
         agg = joined.groupby(["station_id", "origin"]).agg(
             points=("y", "size"), y=("y", "sum"), **{f"e_{k}": (f"e_{k}", "sum") for k in components}
         ).reset_index()
