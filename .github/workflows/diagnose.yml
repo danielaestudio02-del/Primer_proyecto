@@ -1,0 +1,30 @@
+name: Diagnose recent accuracy
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/hopeful-thompson-xaelrr]
+    paths: [analysis/diagnose_recent.py, analysis/recent_models.py, .github/workflows/diagnose.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-pipeline.txt
+      - name: Install pipeline dependencies
+        run: python -m pip install -r requirements-pipeline.txt
+      - name: Accuracy of each predictor on the latest real cycles (read-only)
+        run: python analysis/diagnose_recent.py 36
