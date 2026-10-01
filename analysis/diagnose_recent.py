@@ -129,5 +129,74 @@ def main() -> None:
     print(pd.DataFrame(cyc).T.round(1).to_string())
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and not (len(sys.argv) > 2 and sys.argv[2] == "explore"):
     main()
+
+
+def explore() -> None:
+    """Serie cruda reciente, rezagos, relación entre estaciones y endpoints de la API."""
+    client = pp.supabase_client()
+    h = pp.load_observations(client)
+    h["station_id"] = h["station_id"].astype(str)
+    wide = h.pivot(index="observed_at", columns="station_id", values="demand").sort_index().astype(float)
+    last = wide.index.max()
+    recent = wide[wide.index > last - pd.Timedelta(hours=24)]
+    before = wide[(wide.index > last - pd.Timedelta(days=8)) & (wide.index <= last - pd.Timedelta(days=7))]
+    print("\nSerie cruda, últimas 3 h (filas = intervalos de 15 min):")
+    print(recent.tail(12).rename(index=lambda t: t.tz_convert(TZ).strftime("%d/%m %H:%M")).astype(int).to_string())
+    print("\nMisma ventana hace 7 días:")
+    print(before.tail(12).rename(index=lambda t: t.tz_convert(TZ).strftime("%d/%m %H:%M")).astype(int).to_string())
+    print("\nMedia y coef. de variación por estación: últimas 24 h vs mismo día hace 7 días")
+    def cv(f):
+        return (f.diff().abs().mean() / f.mean().clip(lower=1)).round(2)
+    print(pd.DataFrame({"media_24h": recent.mean().round(0), "media_semana_ant": before.mean().round(0),
+                        "salto_medio_24h": cv(recent), "salto_medio_ant": cv(before)}).to_string())
+
+    def acc(y, p):
+        y, p = np.asarray(y, float), np.asarray(p, float)
+        ok = ~np.isnan(y) & ~np.isnan(p)
+        return max(0.0, 100 * (1 - np.abs(y[ok] - p[ok]).sum() / max(y[ok].sum(), 1)))
+
+    print("\nAccuracy de y[t] ≈ y[t-k] (últimas 24 h), por rezago k en intervalos:")
+    lags = {k: {s: round(acc(recent[s], wide[s].shift(k).reindex(recent.index)), 1) for s in wide} for k in (1, 2, 3, 4, 8, 96, 672)}
+    print(pd.DataFrame(lags).to_string())
+
+    print("\nMejor estación/rezago para explicar cada estación (y_s[t] ≈ c · y_o[t-k], k=1..8):")
+    out = []
+    for s in wide:
+        best = (0, None, None)
+        for o in wide:
+            for k in range(1, 9):
+                x = wide[o].shift(k).reindex(recent.index)
+                c = recent[s].sum() / max(x.sum(), 1)
+                a = acc(recent[s], c * x)
+                if a > best[0]:
+                    best = (a, o, k)
+        out.append({"estación": s, "accuracy": round(best[0], 1), "explicada_por": best[1], "rezago": best[2],
+                    "propia_k1": lags[1][s]})
+    print(pd.DataFrame(out).to_string(index=False))
+
+    print("\nEndpoints de la API (openapi):")
+    try:
+        r = pp.api_get("/openapi.json")
+        paths = r.json().get("paths", {}) if r.status_code == 200 else {}
+        for p, ops in paths.items():
+            print(" ", p, sorted(ops))
+    except Exception as exc:  # noqa: BLE001
+        print("  no disponible:", type(exc).__name__)
+    cyc = pp.api_get("/v1/forecast-cycles/current")
+    print("\nCiclo actual (claves):", cyc.status_code, sorted(cyc.json().keys()) if cyc.headers.get("content-type", "").startswith("application/json") else "")
+    try:
+        body = cyc.json()
+        extra = {k: v for k, v in body.items() if k not in ("targets",)}
+        print(str(extra)[:1500])
+        if body.get("targets"):
+            print("target ejemplo:", body["targets"][0])
+    except Exception:  # noqa: BLE001
+        pass
+    s = pp.api_get("/v1/stream/observations", {"limit": 2})
+    print("\nStream ejemplo:", s.status_code, str(s.json())[:800] if s.status_code == 200 else "")
+
+
+if __name__ == "__main__" and len(sys.argv) > 2 and sys.argv[2] == "explore":
+    explore()

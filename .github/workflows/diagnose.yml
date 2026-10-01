@@ -27,4 +27,4 @@ jobs:
       - name: Install pipeline dependencies
         run: python -m pip install -r requirements-pipeline.txt
       - name: Accuracy of each predictor on the latest real cycles (read-only)
-        run: python analysis/diagnose_recent.py 36
+        run: python analysis/diagnose_recent.py 36 explore
