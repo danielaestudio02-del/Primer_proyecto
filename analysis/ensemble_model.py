@@ -153,7 +153,11 @@ def training_rows(history: pd.DataFrame, cutoff: pd.Timestamp) -> pd.DataFrame:
     return rows.loc[rows["y"].notna() & (rows["target_at"] <= cutoff)].reset_index(drop=True)
 
 
-ADAPTIVE_COMPONENTS = ("prophet", "lightgbm", "daily_lvl", "persist")
+# Components blended by the adaptive mode. prophet_slot (Prophet scaled by the level
+# observed around the same slot yesterday) was added for peak-shape drift; models saved
+# before it keep their original four components (see _components).
+ADAPTIVE_COMPONENTS = ("prophet", "lightgbm", "daily_lvl", "persist", "prophet_slot")
+LEGACY_ADAPTIVE_COMPONENTS = ("prophet", "lightgbm", "daily_lvl", "persist")
 
 
 class PulsoEnsemble:
@@ -161,8 +165,10 @@ class PulsoEnsemble:
 
     Fixed mode: 65% Prophet + 35% LightGBM. Adaptive mode (default for new models):
     for every station and origin, each component (Prophet, LightGBM, same slot
-    yesterday scaled to today's level, persistence) is scored on the previous
-    `adaptive_lookback_h` hours using only targets already observed at the origin,
+    yesterday scaled to today's level, persistence and Prophet scaled by the level
+    observed around the same slot yesterday) is scored on the previous
+    `adaptive_lookback_h` hours using only targets already observed at the origin
+    (errors weighted by exp(-age / adaptive_decay_h), so the last hours count most),
     and the components are blended with weights proportional to 1 / WAPE^2.
     """
 
@@ -175,10 +181,13 @@ class PulsoEnsemble:
         adaptive: bool = True,
         adaptive_lookback_h: int = 24,
         adaptive_min_points: int = 16,
+        adaptive_decay_h: float | None = 3.0,
     ) -> None:
         self.adaptive = adaptive
         self.adaptive_lookback_h = adaptive_lookback_h
         self.adaptive_min_points = adaptive_min_points
+        self.adaptive_components = ADAPTIVE_COMPONENTS
+        self.adaptive_decay_h = adaptive_decay_h
         self.prophet_weight = prophet_weight
         self.level_window = level_window
         self.level_clip = level_clip
@@ -204,7 +213,8 @@ class PulsoEnsemble:
             "lightgbm": self.lgbm_params,
             "adaptive": getattr(self, "adaptive", False),
             "adaptive_lookback_h": getattr(self, "adaptive_lookback_h", None),
-            "adaptive_components": list(ADAPTIVE_COMPONENTS),
+            "adaptive_components": list(self._components()),
+            "adaptive_decay_h": getattr(self, "adaptive_decay_h", None),
         }
 
     # ----- training -------------------------------------------------------
@@ -242,6 +252,9 @@ class PulsoEnsemble:
         return self
 
     # ----- inference ------------------------------------------------------
+    def _components(self) -> tuple[str, ...]:
+        return tuple(getattr(self, "adaptive_components", LEGACY_ADAPTIVE_COMPONENTS))
+
     def _prophet(self, station: str):
         if station not in self._prophet_cache:
             from prophet.serialize import model_from_json
@@ -278,11 +291,15 @@ class PulsoEnsemble:
         lgbm_pred = np.maximum(0, self.lgbm.predict(features[FEATURES]))
 
         prophet_pred = np.full(len(rows), np.nan)
+        slot_pred = np.full(len(rows), np.nan)
         level = np.full(len(rows), np.nan)
         lookup = _series_lookup(history)
+        with_slot = "prophet_slot" in self._components()
         for station, index in rows.groupby("station_id").groups.items():
             subset = rows.loc[index]
             start = subset["origin"].min() - (self.level_window - 1) * STEP
+            if with_slot:
+                start = min(start, subset["target_at"].min() - pd.Timedelta(days=1) - self.level_window * STEP)
             curve = self._prophet_curve(station, start, subset["target_at"].max())
             observed = lookup.xs(station, level="station_id") if station in lookup.index.get_level_values(0) else pd.Series(dtype=float)
             observed = observed[observed.index <= subset["origin"].max()]
@@ -290,6 +307,13 @@ class PulsoEnsemble:
             positions = rows.index.get_indexer(index)
             level[positions] = ratio.reindex(subset["origin"]).to_numpy()
             prophet_pred[positions] = np.maximum(0, curve.reindex(subset["target_at"]).to_numpy()) * level[positions]
+            if with_slot:
+                # Level of the window centred on the same slot yesterday (already observed at the
+                # origin): a peak that grew or shrank yesterday is corrected from its first slot,
+                # instead of waiting for the last 2 h to fill with peak data.
+                anchor = subset["target_at"] - pd.Timedelta(days=1) + (self.level_window // 2) * STEP
+                slot_ratio = ratio.reindex(anchor).fillna(1.0).to_numpy()
+                slot_pred[positions] = np.maximum(0, curve.reindex(subset["target_at"]).to_numpy()) * slot_ratio
         ensemble = self.prophet_weight * prophet_pred + (1 - self.prophet_weight) * lgbm_pred
 
         # Simple recent references used by the adaptive blend.
@@ -310,6 +334,7 @@ class PulsoEnsemble:
                 "lightgbm": lgbm_pred,
                 "daily_lvl": daily_lvl,
                 "persist": persist,
+                "prophet_slot": slot_pred,
                 "level_ratio": level,
                 "fixed": np.maximum(0, ensemble),
                 "prediction": np.maximum(0, ensemble),
@@ -321,6 +346,7 @@ class PulsoEnsemble:
         """Blend weights per (station, origin) from each component's WAPE on the previous
         `adaptive_lookback_h` hourly origins whose targets were observed by the origin."""
         lookback = int(getattr(self, "adaptive_lookback_h", 24))
+        components = self._components()
         keys = rows[["station_id", "origin"]].astype({"station_id": str}).drop_duplicates()
         pairs = keys.loc[keys.index.repeat(lookback)].reset_index(drop=True)
         pairs["shadow_origin"] = pairs["origin"] - pd.to_timedelta(np.tile(np.arange(1, lookback + 1), len(keys)), unit="h")
@@ -331,37 +357,47 @@ class PulsoEnsemble:
         lookup = _series_lookup(history)
         shadow["y"] = lookup.reindex(pd.MultiIndex.from_arrays([shadow["station_id"], shadow["target_at"]])).to_numpy(float)
         shadow = shadow[shadow["y"].notna()].reset_index(drop=True)
-        empty = pd.DataFrame(columns=["station_id", "origin", "points", *[f"w_{k}" for k in ADAPTIVE_COMPONENTS]])
+        empty = pd.DataFrame(columns=["station_id", "origin", "points", *[f"w_{k}" for k in components]])
         if shadow.empty:
             return empty
         comp = self.predict_components(history, shadow)
-        for k in ADAPTIVE_COMPONENTS:
+        for k in components:
             shadow[f"e_{k}"] = (shadow["y"] - comp[k].to_numpy()).abs()
         joined = pairs.merge(shadow.rename(columns={"origin": "shadow_origin"}), on=["station_id", "shadow_origin"])
-        joined = joined[joined["target_at"] <= joined["origin"]]
+        joined = joined[joined["target_at"] <= joined["origin"]].copy()
+        decay = getattr(self, "adaptive_decay_h", None)
+        if decay:
+            # Recent errors count more: a drift phase lasts a few hours, so the blend must
+            # follow it before the 24 h window fills with the new regime.
+            age_h = (joined["origin"] - joined["shadow_origin"]) / pd.Timedelta(hours=1)
+            recency = np.exp(-(age_h - 1) / decay)
+            joined["y"] = joined["y"] * recency
+            for k in components:
+                joined[f"e_{k}"] = joined[f"e_{k}"] * recency
         agg = joined.groupby(["station_id", "origin"]).agg(
-            points=("y", "size"), y=("y", "sum"), **{f"e_{k}": (f"e_{k}", "sum") for k in ADAPTIVE_COMPONENTS}
+            points=("y", "size"), y=("y", "sum"), **{f"e_{k}": (f"e_{k}", "sum") for k in components}
         ).reset_index()
         inv = pd.DataFrame({
-            k: 1 / np.maximum(agg[f"e_{k}"] / agg["y"].clip(lower=1), 0.02) ** 2 for k in ADAPTIVE_COMPONENTS
+            k: 1 / np.maximum(agg[f"e_{k}"] / agg["y"].clip(lower=1), 0.02) ** 2 for k in components
         })
         weights = inv.div(inv.sum(axis=1), axis=0)
-        for k in ADAPTIVE_COMPONENTS:
+        for k in components:
             agg[f"w_{k}"] = weights[k]
-        return agg[["station_id", "origin", "points", *[f"w_{k}" for k in ADAPTIVE_COMPONENTS]]]
+        return agg[["station_id", "origin", "points", *[f"w_{k}" for k in components]]]
 
     def predict_detailed(self, history: pd.DataFrame, rows: pd.DataFrame) -> pd.DataFrame:
         """Components, blend weights and final prediction for each row."""
         comp = self.predict_components(history, rows)
         if not getattr(self, "adaptive", False):
             return comp
+        components = self._components()
         keyed = rows[["station_id", "origin"]].astype({"station_id": str})
         weights = keyed.merge(self.adaptive_weights(history, rows), on=["station_id", "origin"], how="left")
         weights.index = rows.index
         ok = weights["points"].fillna(0) >= getattr(self, "adaptive_min_points", 16)
-        blend = sum(weights[f"w_{k}"].fillna(0) * comp[k] for k in ADAPTIVE_COMPONENTS)
+        blend = sum(weights[f"w_{k}"].fillna(0) * comp[k] for k in components)
         comp["prediction"] = np.maximum(0, np.where(ok, blend, comp["fixed"]))
-        for k in ADAPTIVE_COMPONENTS:
+        for k in components:
             comp[f"w_{k}"] = np.where(ok, weights[f"w_{k}"], np.nan)
         return comp
 
