@@ -81,3 +81,65 @@ def predict_recent(
             for s, st in enumerate(stations):
                 out["pooled_ar"][(st, h)] = float(max(0.0, pred[s]))
     return out
+
+
+SELECTOR_KINDS = {"cross_ar_12h": ("cross_ar", 12), "cross_ar_24h": ("cross_ar", 24),
+                  "own_ar_12h": ("own_ar", 12), "pooled_ar_24h": ("pooled_ar", 24)}
+
+
+def _recent_table(wide: pd.DataFrame, origin: pd.Timestamp) -> dict[str, dict[tuple[str, int], float]]:
+    out: dict[str, dict[tuple[str, int], float]] = {}
+    for window in sorted({w for _, w in SELECTOR_KINDS.values()}):
+        kinds = tuple(sorted({k for k, w in SELECTOR_KINDS.values() if w == window}))
+        pr = predict_recent(wide, origin, window_h=window, kinds=kinds)
+        for name, (k, w) in SELECTOR_KINDS.items():
+            if w == window:
+                out[name] = pr.get(k, {})
+    last = wide.loc[:origin].iloc[-1]
+    out["persist"] = {(st, h): float(last[st]) for st in wide.columns for h in (1, 2, 3, 4)}
+    return out
+
+
+def selector_predict(history: pd.DataFrame, rows: pd.DataFrame, base_predict, lookback_h: int = 6):
+    """Por estación, usa el predictor con menor WAPE en los `lookback_h` orígenes horarios
+    previos (targets ya observados en el origen). Candidatos: el champion (`base_predict`),
+    los modelos de ventana corta y la persistencia. Devuelve (valores, elección por estación)."""
+    origin = pd.Timestamp(rows["origin"].iloc[0])
+    history = history[history["observed_at"] <= origin]
+    wide = wide_matrix(history)
+    stations = [str(s) for s in wide.columns]
+    shadow_origins = [origin - pd.Timedelta(hours=k) for k in range(1, lookback_h + 1)]
+    shadow = pd.DataFrame(
+        [(s, o, h) for o in shadow_origins for s in stations for h in (1, 2, 3, 4)],
+        columns=["station_id", "origin", "horizon"],
+    )
+    shadow["target_at"] = shadow["origin"] + pd.to_timedelta(15 * shadow["horizon"], unit="min")
+    shadow = shadow[shadow["target_at"] <= origin].reset_index(drop=True)
+    shadow["y"] = [wide.at[t, s] if t in wide.index else np.nan for s, t in zip(shadow["station_id"], shadow["target_at"])]
+    preds = {"champion": np.asarray(base_predict(history, shadow[["station_id", "origin", "horizon", "target_at"]]), float)}
+    tables = {o: _recent_table(wide, o) for o in shadow_origins}
+    for name in [*SELECTOR_KINDS, "persist"]:
+        preds[name] = np.array([tables[o][name].get((s, h), np.nan)
+                                for s, o, h in zip(shadow["station_id"], shadow["origin"], shadow["horizon"])])
+    chosen: dict[str, str] = {}
+    for s in stations:
+        mask = (shadow["station_id"] == s).to_numpy() & shadow["y"].notna().to_numpy()
+        y = shadow["y"].to_numpy()[mask]
+        best, best_err = "champion", np.inf
+        for name, p in preds.items():
+            pm = p[mask]
+            if len(y) == 0 or np.isnan(pm).any():
+                continue
+            err = np.abs(y - pm).sum() / max(y.sum(), 1)
+            if err < best_err - 1e-9:
+                best, best_err = name, err
+        chosen[s] = best
+
+    now_champion = np.asarray(base_predict(history, rows), float)
+    now = _recent_table(wide, origin)
+    values = []
+    for i, (s, h) in enumerate(zip(rows["station_id"].astype(str), rows["horizon"])):
+        kind = chosen.get(s, "champion")
+        v = now_champion[i] if kind == "champion" else now[kind].get((s, int(h)), np.nan)
+        values.append(now_champion[i] if not np.isfinite(v) else v)
+    return np.maximum(0, np.array(values, float)), chosen

@@ -86,6 +86,17 @@ def main() -> None:
         for k, v in vals.items():
             rows[f"{k}_{window}h"] = v
 
+    # Selector de producción (recent_models.selector_predict), origen por origen.
+    from recent_models import selector_predict
+    sel = np.full(len(rows), np.nan)
+    eval_origins = sorted(rows["origin"].unique())[6:]
+    for origin in eval_origins:
+        idx = rows.index[rows["origin"] == origin]
+        values, chosen = selector_predict(history, rows.loc[idx, ["station_id", "origin", "horizon", "target_at"]], model.predict)
+        sel[rows.index.get_indexer(idx)] = values
+    rows["selector_produccion"] = sel
+    print("Última elección del selector:", chosen)
+
     base = [c for c in rows if c.endswith(("ar_12h", "ar_24h", "ar_48h"))] + ["persist", "mean_1h", "mean_2h", "trend", "daily", "daily_x_1h_noclip", "weekly",
             "weekly_x_1h_noclip", "daily_lvl", "prophet", "lightgbm", "prediction"]
     base = [c for c in base if c in rows]
@@ -112,7 +123,7 @@ def main() -> None:
 
     ev = rows[(rows["origin"] > origins[5]) & rows["y"].notna()]
     ev_out = ev[ev["origin"] > train_end]
-    cols = [c for c in ["enviado", *base, "sel_best_2h", "sel_best_3h", "sel_best_6h",
+    cols = [c for c in ["enviado", "selector_produccion", *base, "sel_best_2h", "sel_best_3h", "sel_best_6h",
                         "sel_blend_2h", "sel_blend_3h", "sel_blend_6h"] if c in ev]
     last6 = ev[ev["origin"] >= ev["origin"].max() - pd.Timedelta(hours=5)]
     table = pd.DataFrame({

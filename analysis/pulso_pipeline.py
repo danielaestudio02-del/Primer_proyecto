@@ -25,6 +25,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from supabase import Client, create_client
 
+from recent_models import selector_predict
 from ensemble_model import FEATURES as ENSEMBLE_FEATURES
 from ensemble_model import PulsoEnsemble
 from forecasting_core import build_examples, score
@@ -687,6 +688,15 @@ def legacy_rf_features(history: pd.DataFrame, target_rows: pd.DataFrame) -> pd.D
 
 def predict_cycle(champion: dict, history: pd.DataFrame, target_rows: pd.DataFrame) -> np.ndarray:
     if "model" in champion:
+        # Runtime selector: per station, the champion or a short-window model, whichever
+        # had the lowest WAPE over the previous 6 hourly origins (see recent_models.py).
+        try:
+            values, chosen = selector_predict(history, target_rows, champion["model"].predict)
+            summary = pd.Series(chosen).value_counts().to_dict()
+            print(f"Selector por estación (últimas 6 h): {summary} · {chosen}")
+            return values
+        except Exception as exc:  # the champion alone is always a valid fallback
+            print(f"Selector no disponible ({type(exc).__name__}: {exc}); se usa el champion.")
         return champion["model"].predict(history, target_rows)
     features = legacy_rf_features(history, target_rows)
     return champion["pipeline"].predict(features[FEATURES])
