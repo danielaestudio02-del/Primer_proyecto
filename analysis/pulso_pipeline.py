@@ -134,6 +134,56 @@ def set_cursor(client: Client, cursor: str, last_observed_at: str | None) -> Non
     client.table("collector_state").update(update).eq("singleton", True).execute()
 
 
+def v2_count_row(row: dict) -> bool:
+    return row.get("schema_version") == 2 or "measurement" in row
+
+
+def parse_demand(row: dict) -> int | None:
+    """Demand of a stream record under contract v1 (flat numeric 'demand') or v2
+    ('measurement': decimal text value, unit 'passengers', quality observed/missing).
+    Returns None for a v2 'missing' record; raises on anything malformed."""
+    if v2_count_row(row):
+        m = row.get("measurement")
+        if not isinstance(m, dict):
+            raise RuntimeError("Registro v2 sin 'measurement'.")
+        quality = m.get("quality")
+        if quality == "missing":
+            return None
+        if quality != "observed":
+            raise RuntimeError(f"Calidad v2 desconocida: {quality!r}.")
+        if m.get("unit") not in (None, "passengers"):
+            raise RuntimeError(f"Unidad v2 inesperada: {m.get('unit')!r}.")
+        raw = m.get("value")
+        if raw is None:
+            return None
+        try:
+            value = float(str(raw))
+        except ValueError:
+            raise RuntimeError(f"Valor v2 no decimal: {raw!r}.") from None
+    else:
+        raw = row.get("demand")
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise RuntimeError("El stream contiene demanda no numérica.")
+        value = float(raw)
+    if not math.isfinite(value) or value < 0:
+        raise RuntimeError("El stream contiene demanda negativa o no finita.")
+    return int(round(value))
+
+
+def fill_gaps(history: pd.DataFrame, cutoff: pd.Timestamp) -> pd.DataFrame:
+    """Complete 15-min grid per station up to the cutoff: missing (v2) or not yet
+    released slots take the last observed value (a gap is not zero)."""
+    frames = []
+    for station, g in history.groupby("station_id"):
+        series = g.set_index("observed_at")["demand"].astype(float).sort_index()
+        grid = pd.date_range(series.index.min(), cutoff, freq="15min")
+        filled = series.reindex(grid).ffill()
+        frames.append(pd.DataFrame({"station_id": station, "observed_at": grid, "demand": filled.to_numpy()}))
+    out = pd.concat(frames, ignore_index=True).dropna(subset=["demand"])
+    out["station_id"] = out["station_id"].astype("string")
+    return out
+
+
 def sync_stream(client: Client) -> int:
     """Fetch released pages and only confirm a page cursor after its upsert."""
     state = (
@@ -157,6 +207,8 @@ def sync_stream(client: Client) -> int:
     ).execute()
     run_id = run.data[0]["run_id"] if run.data else None
     received = 0
+    missing = 0
+    v2_rows = 0
     last_observed: str | None = None
     seen_cursors: set[str] = set()
 
@@ -181,13 +233,15 @@ def sync_stream(client: Client) -> int:
             for row in page:
                 station_id = str(row.get("station_id", ""))
                 observed_at = row.get("observed_at")
-                demand = row.get("demand")
                 if station_id not in stations or not observed_at:
                     raise RuntimeError("El stream contiene estación o timestamp inválido.")
-                if isinstance(demand, bool) or not isinstance(demand, (int, float)):
-                    raise RuntimeError("El stream contiene demanda no numérica.")
-                if not math.isfinite(float(demand)) or demand < 0 or int(demand) != demand:
-                    raise RuntimeError("El stream contiene demanda negativa o no entera.")
+                demand = parse_demand(row)
+                if demand is None:
+                    # v2 'missing': not zero; the gap is filled at forecast time.
+                    missing += 1
+                    continue
+                if v2_count_row(row):
+                    v2_rows += 1
                 timestamp = pd.Timestamp(observed_at)
                 if timestamp.tzinfo is None:
                     raise RuntimeError("El stream contiene un timestamp sin zona horaria.")
@@ -228,7 +282,7 @@ def sync_stream(client: Client) -> int:
                     "cursor_after": cursor_after,
                     "rows_received": received,
                     "rows_upserted": received,
-                    "metadata": {"pages": len(seen_cursors) + 1},
+                    "metadata": {"pages": len(seen_cursors) + 1, "v2_rows": v2_rows, "missing_rows": missing},
                 }
             ).eq("run_id", run_id).execute()
     except Exception as exc:
@@ -253,7 +307,8 @@ def sync_stream(client: Client) -> int:
             }
         ).eq("singleton", True).execute()
 
-    print(f"Sincronización del stream completada: {received:,} filas nuevas.")
+    print(f"Sincronización del stream completada: {received:,} filas nuevas"
+          f" (v2: {v2_rows:,}; faltantes señalizados: {missing:,}).")
     return received
 
 
@@ -467,12 +522,11 @@ def train_and_promote(client: Client, cutoff: pd.Timestamp) -> dict | None:
     if history.empty:
         raise RuntimeError("No hay datos anteriores al cutoff para entrenar.")
     station_latest = history.groupby("station_id")["observed_at"].max()
-    too_stale = station_latest[station_latest < cutoff - pd.Timedelta(minutes=30)]
-    if not too_stale.empty:
-        raise RuntimeError(
-            "Faltan observaciones recientes al cutoff para estaciones: "
-            + ", ".join(map(str, too_stale.index.tolist()))
-        )
+    stale = station_latest[station_latest < cutoff - pd.Timedelta(minutes=30)]
+    if not stale.empty:
+        # Contract v2 (release every 30 min, flagged missing values): train on the
+        # observed values only; Prophet and LightGBM tolerate the gaps.
+        print("Aviso: entrenamiento con huecos recientes en " + ", ".join(map(str, stale.index.tolist())))
 
     targets = submitted_targets(client, history)
     recent = None
@@ -942,12 +996,14 @@ def run_forecast(client: Client, send: bool) -> None:
         raise RuntimeError("El champion fue entrenado con datos posteriores al cutoff.")
     history = load_observations(client, cutoff)
     station_latest = history.groupby("station_id")["observed_at"].max()
-    too_stale = station_latest[station_latest < cutoff - pd.Timedelta(minutes=30)]
-    if not too_stale.empty:
-        raise RuntimeError(
-            "Datos desactualizados al cutoff para estaciones: "
-            + ", ".join(map(str, too_stale.index.tolist()))
-        )
+    # Contract v2 releases every 30 min and may flag missing values: a gap must not
+    # cost the cycle, so it is reported and filled with the last observed value.
+    stale = station_latest[station_latest < cutoff - pd.Timedelta(minutes=30)]
+    if not stale.empty:
+        print("Aviso: última observación real anterior a cutoff-30min en "
+              + ", ".join(f"{s} ({t.isoformat()})" for s, t in stale.items())
+              + "; se completa con el último valor observado.")
+    history = fill_gaps(history, cutoff)
     target_rows = cycle_target_rows(history, cycle)
     raw_values = predict_cycle(champion, history, target_rows)
     predictions = [
