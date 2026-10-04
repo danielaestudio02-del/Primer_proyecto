@@ -25,6 +25,18 @@ def main() -> None:
     print("Última observación guardada:", last[0]["observed_at"] if last else None)
     cycle = pp.api_get("/v1/forecast-cycles/current")
     print("Ciclo actual:", cycle.status_code, {k: v for k, v in cycle.json().items() if k != "targets"} if cycle.status_code == 200 else cycle.text[:300])
+    me = pp.api_get("/v1/me")
+    print("Yo:", me.status_code, me.text[:600])
+    lb = pp.api_get("/v1/leaderboard")
+    print("Leaderboard:", lb.status_code)
+    try:
+        body = lb.json()
+        rows = body if isinstance(body, list) else next((v for v in body.values() if isinstance(v, list)), [])
+        print("claves:", list(body.keys()) if isinstance(body, dict) else "lista")
+        for r in rows[:40]:
+            print("  ", str(r)[:400])
+    except Exception as exc:  # noqa: BLE001
+        print("  no JSON:", lb.text[:800], exc)
     clock = pp.api_get("/v1/clock")
     print("Reloj:", clock.status_code, clock.text[:400])
 
